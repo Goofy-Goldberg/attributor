@@ -442,8 +442,9 @@ class GraphLinkageDbTests(unittest.TestCase):
         self.assertTrue(top["connected"])
 
     def test_recompute_free_rescore_on_weight_change(self) -> None:
-        intel_db.save_search(self._apex_cert_scan("a.com", "203.0.113.1", "rarecert", "2026-03-01T00:00:00+00:00"))
-        intel_db.save_search(self._apex_cert_scan("b.com", "203.0.113.2", "rarecert", "2026-03-02T00:00:00+00:00"))
+        observed = datetime.now(timezone.utc).isoformat()
+        intel_db.save_search(self._apex_cert_scan("a.com", "203.0.113.1", "rarecert", observed))
+        intel_db.save_search(self._apex_cert_scan("b.com", "203.0.113.2", "rarecert", observed))
 
         before = check.link_evidence("a.com", "b.com")["score"]
         original = dict(evidence_meta.SELECTOR_BASE_WEIGHTS)

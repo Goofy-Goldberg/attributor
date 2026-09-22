@@ -773,27 +773,65 @@ def _graph_strength(score: float, evidence: list[dict]) -> str:
     return "weak"
 
 
-# The two graph kinds that carry the same webmaster-verification codes:
-# `site_verification` is scraped from a <meta> tag, `dns_txt_token` from a DNS
-# TXT record. A provider issues one code and site owners routinely publish it
-# both ways, so the same secret would otherwise be counted as two independent
-# selectors and inflate a link's score.
-#
-# Which one survives is deliberate rather than arbitrary: a token in DNS proves
-# control of the *zone*, a token in HTML only proves control of the page, so the
-# DNS spelling is kept when both are present. They stay separate kinds in the
-# graph — provenance is worth keeping — and are collapsed only here, at scoring
-# time, which is the decision the user made when this was raised.
+# New projections share a site_verification selector across DNS and HTML,
+# retaining provenance on observations. Keep deduplication for legacy rows
+# that still use dns_txt_token until their derived graph is rebuilt.
 _VERIFICATION_TOKEN_KINDS = ("dns_txt_token", "site_verification")
+
+# These measurements are related, not independent corroboration. Without
+# asset-level provenance, use the strongest match in each family per pair;
+# keep every row visible so analysts can inspect the other measurements.
+_EVIDENCE_GROUPS = {
+    "favicon_md5": "favicon",
+    "favicon_mmh3": "favicon",
+    "tls_cert_sha256": "tls_certificate",
+    "tls_spki": "tls_certificate",
+    "tls_san": "tls_certificate",
+}
+
+
+def _limit_related_evidence(evidence: list[dict]) -> None:
+    groups: dict[str, list[dict]] = {}
+    for item in evidence:
+        group = _EVIDENCE_GROUPS.get(item["kind"])
+        if group:
+            item["evidence_group"] = group
+            item["raw_weight"] = item["weight"]
+            groups.setdefault(group, []).append(item)
+    for group, items in groups.items():
+        if len(items) < 2:
+            continue
+        # Stable tie-break makes both directions of a link explain the same
+        # contributing selector, regardless of query result order.
+        winner = min(items, key=lambda item: (-item["weight"], item["kind"], item["value"]))
+        label = "favicon" if group == "favicon" else "TLS certificate"
+        for item in items:
+            if item is winner:
+                item["scoring_note"] = (
+                    f"Only the strongest {label} match contributes to the score. "
+                    "Related measurements are shown below without additional points."
+                )
+            else:
+                item["weight"] = 0.0
+                item["scoring_note"] = (
+                    f"Shown for context: the strongest {label} match already contributes to the score. "
+                    "This related measurement adds no extra points."
+                )
 
 
 def _verification_token_identity(row: dict) -> str | None:
-    """`provider|token` for a verification-code row, lowercased; None otherwise."""
+    """Canonical provider plus case-sensitive proof for legacy deduplication."""
+    from db.intel_db import normalize_site_verification_value
+
     kind = str(row.get("kind") or "")
     if kind not in _VERIFICATION_TOKEN_KINDS:
         return None
-    value = str(row.get("value") or "").strip().lower()
-    return value or None
+    value = str(row.get("value") or "").strip()
+    canonical = normalize_site_verification_value(value)
+    if canonical:
+        return canonical
+    provider, separator, token = value.partition("|")
+    return f"{provider.lower()}|{token}" if separator and provider and token else None
 
 
 def _dedupe_verification_tokens(rows: list[dict]) -> list[dict]:
@@ -843,11 +881,9 @@ def _assemble_link(
         cert_shas = [str(row["value"]) for row in shared_selectors if row.get("kind") == "tls_cert_sha256" and row.get("value")]
         cert_meta = intel_db.tls_cert_context(cert_shas) if cert_shas else {}
     evidence: list[dict] = []
-    total = 0.0
     for row in _dedupe_verification_tokens(shared_selectors):
-        ev, weight = _score_selector_row(row, cert_meta)
+        ev, _ = _score_selector_row(row, cert_meta)
         evidence.append(ev)
-        total += weight
     if ip_meta is None:
         ip_meta = intel_db.ip_network_context([str(row.get("value") or "") for row in shared_ips])
     for row in shared_ips:
@@ -856,7 +892,8 @@ def _assemble_link(
         # graph, but they must never create a link); the noise test relies on this.
         if weight > 0:
             evidence.append(ev)
-            total += weight
+    _limit_related_evidence(evidence)
+    total = sum(item["weight"] for item in evidence)
     evidence.sort(key=lambda e: e["weight"], reverse=True)
     return {
         "score": round(total, 2),

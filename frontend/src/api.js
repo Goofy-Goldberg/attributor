@@ -404,15 +404,13 @@ export function normalizeJob(payload, fallbackId = null) {
   };
 }
 
-// Mirrors the backend's saturating score→confidence curve so pairs stored
-// before the confidence field existed still display a bounded percentage
-// instead of a raw additive score clamped at 100.
+// Mirrors the backend's legacy score-to-confidence mapping for older API data.
 export function confidenceFromScore(score) {
   const value = Number(score);
   if (!Number.isFinite(value) || value <= 0) {
     return 0;
   }
-  return Math.round((100 * value) / (value + 65));
+  return Math.min(99, Math.round((100 * value) / (value + 65)));
 }
 
 // ── Global correlation graph ────────────────────────────────────────────────
@@ -470,6 +468,10 @@ function normalizeSharedNode(node, index) {
     // in years. Lets the UI flag it distinctly instead of just a smaller number.
     degraded: raw.degraded === true,
     weight: pickFirst(raw, ["weight"], null),
+    contribution: pickFirst(raw, ["weight", "contribution"], null),
+    rawWeight: pickFirst(raw, ["raw_weight", "rawWeight"], null),
+    scoringNote: pickFirst(raw, ["scoring_note", "scoringNote"], null),
+    evidenceGroup: pickFirst(raw, ["evidence_group", "evidenceGroup"], null),
     sources: coerceArray(raw.sources).map((entry) => readableValue(entry)).filter(Boolean),
     windowA: window(pickFirst(raw, ["window_a", "windowA"])),
     windowB: window(pickFirst(raw, ["window_b", "windowB"])),

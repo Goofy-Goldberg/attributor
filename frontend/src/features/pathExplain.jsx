@@ -12,19 +12,22 @@ export function PathChain({ chain }) {
     return null;
   }
   return (
-    <ol className="linkage-list path-chain">
-      {chain.map((hop, index) => (
-        <li className="path-chain-hop" key={`${hop.from}|${hop.to}`}>
-          <span className="path-chain-step">Step {index + 1}</span>
-          <ConnectionCard
-            expanded={expandedHop === index}
-            leftLabel={hop.from}
-            link={{ ...hop, a: hop.from, b: hop.to, target: hop.to }}
-            onToggle={() => setExpandedHop((current) => (current === index ? null : index))}
-            rightLabel={hop.to}
-          />
-        </li>
-      ))}
-    </ol>
+    <>
+      <p>Each step is a separate match between two channels. The chain shows an indirect path; it does not give one match score for its endpoints.</p>
+      <ol className="linkage-list path-chain">
+        {chain.map((hop, index) => (
+          <li className="path-chain-hop" key={`${hop.from}|${hop.to}`}>
+            <span className="path-chain-step">Step {index + 1}</span>
+            <ConnectionCard
+              expanded={expandedHop === index}
+              leftLabel={hop.from}
+              link={{ ...hop, a: hop.from, b: hop.to, target: hop.to }}
+              onToggle={() => setExpandedHop((current) => (current === index ? null : index))}
+              rightLabel={hop.to}
+            />
+          </li>
+        ))}
+      </ol>
+    </>
   );
 }

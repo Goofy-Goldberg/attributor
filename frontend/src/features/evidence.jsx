@@ -1,18 +1,17 @@
 import { memo, useState } from "react";
-import { Badge, Card, ProgressBar, Text, View } from "reshaped";
+import { Badge, Card, Text, View } from "reshaped";
 
 import {
   formatDate,
   formatLabel,
   formatNumber,
-  formatPercent,
 } from "../api.js";
 import { EmptyState } from "../components/primitives.jsx";
 
 const STRENGTH_TIERS = {
-  strong: { tier: "strong", label: "Strong link", color: "positive" },
-  moderate: { tier: "moderate", label: "Moderate link", color: "warning" },
-  weak: { tier: "weak", label: "Weak link", color: "neutral" },
+  strong: { tier: "strong", label: "Strong evidence", color: "positive" },
+  moderate: { tier: "moderate", label: "Moderate evidence", color: "warning" },
+  weak: { tier: "weak", label: "Weak evidence", color: "neutral" },
 };
 
 const SELECTOR_KIND_LABELS = {
@@ -251,8 +250,14 @@ const SharedNodeList = memo(function SharedNodeList({ evidence, leftLabel, right
                   {node.rarity !== null && node.rarity !== undefined ? (
                     <InfoBadge title="Inverse-frequency factor from degree — 1.0 is as rare as it gets, decays toward 0 the more entities share it">rarity {node.rarity}</InfoBadge>
                   ) : null}
-                  {node.weight !== null && node.weight !== undefined ? (
-                    <InfoBadge title="base x rarity x time-overlap x recency — the final contribution to the link's score">weight {Math.round(node.weight)}</InfoBadge>
+                  {node.contribution !== null && node.contribution !== undefined ? (
+                    <InfoBadge title="Points this match adds to the total score">adds {formatNumber(node.contribution ?? node.weight)} points</InfoBadge>
+                  ) : null}
+                  {node.rawWeight !== null && node.rawWeight !== undefined ? (
+                    <InfoBadge title="Points before related measurements are counted together">before adjustment {formatNumber(node.rawWeight)}</InfoBadge>
+                  ) : null}
+                  {node.evidenceGroup ? (
+                    <InfoBadge title="Related measurements are counted together">{formatLabel(node.evidenceGroup)}</InfoBadge>
                   ) : null}
                   {node.timeOverlap !== null && node.timeOverlap !== undefined ? (
                     <InfoBadge title="Time-window overlap factor — do the two sides' own sighting windows agree with each other">overlap {node.timeOverlap}</InfoBadge>
@@ -269,6 +274,11 @@ const SharedNodeList = memo(function SharedNodeList({ evidence, leftLabel, right
                 {node.explanation ? (
                   <Text color="neutral-faded" variant="caption-1">
                     {node.explanation}
+                  </Text>
+                ) : null}
+                {node.scoringNote ? (
+                  <Text color="neutral-faded" variant="caption-1">
+                    {node.scoringNote}
                   </Text>
                 ) : null}
                 {node.kind === "tls_cert_sha256" && (node.certCn || node.certIssuerCn || node.certNotAfter) ? (
@@ -346,7 +356,6 @@ export const ConnectionCard = memo(function ConnectionCard({
   rightLabel,
 }) {
   const strength = linkStrength(link);
-  const barValue = Math.max(4, Math.min(100, link.confidence ?? 0));
   const topKinds = [...new Set((link.evidence || []).map((node) => sharedNodeLabel(node.kind)))].slice(0, 3);
   const heading = rightLabel ? `${leftLabel} ↔ ${rightLabel}` : link.target;
   const key = toggleKey ?? link.b ?? link.target;
@@ -367,8 +376,9 @@ export const ConnectionCard = memo(function ConnectionCard({
       <View align="center" direction="row" gap={4}>
         <View align="center" attributes={{ style: { minWidth: 108 } }} gap={1}>
           <Text variant="title-3" weight="bold">
-            {formatPercent(link.confidence)}
+            {Math.round(link.score ?? 0)}
           </Text>
+          <Text color="neutral-faded" variant="caption-1">Match score</Text>
           <Badge color={strength.color} size="small">
             {strength.label}
           </Badge>
@@ -376,8 +386,7 @@ export const ConnectionCard = memo(function ConnectionCard({
         <View gap={2} grow>
           <Text weight="semibold">{heading}</Text>
           <Text color="neutral-faded" variant="body-2">
-            {(link.evidence || []).length} shared node{(link.evidence || []).length === 1 ? "" : "s"} · score{" "}
-            {Math.round(link.score ?? 0)}
+            {(link.evidence || []).length} shared evidence item{(link.evidence || []).length === 1 ? "" : "s"}
           </Text>
           {topKinds.length > 0 ? (
             <View direction="row" gap={1} wrap>
@@ -388,7 +397,9 @@ export const ConnectionCard = memo(function ConnectionCard({
               ))}
             </View>
           ) : null}
-          <ProgressBar color={strength.color} size="small" value={barValue} />
+          <Text color="neutral-faded" variant="caption-1">
+            A higher score means more shared evidence; it is not a probability of common ownership.
+          </Text>
         </View>
         <Text attributes={{ "aria-hidden": true }} color="neutral-faded">
           {expanded ? "▴" : "▾"}

@@ -1,4 +1,3 @@
-import { formatPercent } from "../api.js";
 import { linkStrength, sharedNodeLabel } from "./evidence.jsx";
 
 // Point-in-time export of what's currently on screen -- a plain-language
@@ -34,23 +33,21 @@ export function downloadBlob(content, filename, mimeType) {
   window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
-// One plain-language sentence for a direct, scored link -- "A and B are
-// linked (strong, score 78) via: TLS certificate fingerprint, shared IP."
+// One plain-language sentence for a direct match, with its score and evidence.
 function describeLink(link, leftLabel, rightLabel) {
   const strength = linkStrength(link);
   const kinds = [...new Set((link.evidence || []).map((node) => sharedNodeLabel(node.kind)))];
   const evidenceText = kinds.length > 0 ? ` via ${kinds.join(", ")}` : "";
-  return `${leftLabel} and ${rightLabel} are linked (${strength.label.toLowerCase()}, score ${Math.round(link.score ?? 0)}, ${formatPercent(link.confidence)} confidence)${evidenceText}.`;
+  return `${leftLabel} and ${rightLabel} share evidence (${strength.label.toLowerCase()}, match score ${Math.round(link.score ?? 0)})${evidenceText}.`;
 }
 
-// One sentence per hop for a multi-hop chain -- "a.com -> b.com via TLS
-// certificate fingerprint (strong, score 90)", one line per step.
+// Each score describes one pairwise match in the chain, not the endpoints.
 function describeChainLines(chain) {
   return (chain || []).map((hop) => {
     const strength = linkStrength(hop);
     const kinds = [...new Set((hop.evidence || []).map((node) => sharedNodeLabel(node.kind)))];
     const evidenceText = kinds.length > 0 ? ` via ${kinds.join(", ")}` : "";
-    return `${hop.from} → ${hop.to}${evidenceText} (${strength.label.toLowerCase()}, score ${Math.round(hop.score ?? 0)})`;
+    return `${hop.from} → ${hop.to}${evidenceText} (${strength.label.toLowerCase()}, match score ${Math.round(hop.score ?? 0)})`;
   });
 }
 
@@ -103,11 +100,12 @@ export function buildReportHtml(scope) {
   <h1>${escapeHtml(title || "Connection report")}</h1>
   <p class="meta">Generated ${escapeHtml(todayLabel())}</p>
   <p class="domains">Channels covered: ${domains.map((d) => escapeHtml(d)).join(", ")}</p>
+  <p>A higher match score means more shared evidence. It is not a probability of common ownership.</p>
 
   <h2>Direct connections (${connectedPairs.length})</h2>
   ${connectedPairs.length > 0 ? `<ul>${pairSentences}</ul>` : "<p>No direct evidence-backed connections among these channels.</p>"}
 
-  ${chainSections ? `<h2>Multi-hop relationships</h2>${chainSections}` : ""}
+  ${chainSections ? `<h2>Multi-hop relationships</h2><p>Each step is a separate match between two channels. A chain describes an indirect path; it does not give one match score for its endpoints.</p>${chainSections}` : ""}
 </body>
 </html>`;
 }

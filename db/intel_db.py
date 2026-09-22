@@ -1972,6 +1972,67 @@ def _normalize_generic_identifier(value: Any) -> str | None:
     return text or None
 
 
+def _normalize_verification_token(value: Any) -> str | None:
+    """Normalize presentation whitespace without changing a proof's spelling.
+
+    DNS and HTML ownership proofs are opaque, provider-minted values.  They
+    are commonly mixed-case and case-sensitive, unlike company names or host
+    names, so `_normalize_generic_identifier` is deliberately the wrong
+    normalizer for this half of a selector.
+    """
+    if isinstance(value, Mapping | list | tuple | set):
+        return None
+    text = str(value or "").strip().strip("\"'`")
+    return text or None
+
+
+def normalize_site_verification_value(provider: Any, token: Any | None = None) -> str | None:
+    """Return the canonical ``provider|token`` site-verification selector.
+
+    ``provider`` accepts the canonical HTML prefixes and the historical DNS
+    producer names that mean the same verification mechanism.  Unknown DNS
+    producers intentionally return ``None``: their tokens remain available as
+    namespaced ``dns_txt_token`` identifiers, but must not acquire the
+    near-identity semantics of a webmaster ownership proof merely because
+    their label happens to include "verification".
+
+    Passing a single ``provider|token`` value is supported for compatibility
+    with legacy selector rows and score-time callers.
+    """
+    if token is None:
+        provider, separator, token = str(provider or "").partition("|")
+        if not separator:
+            return None
+
+    provider_key = _normalize_generic_identifier(provider)
+    code = _normalize_verification_token(token)
+    if not provider_key or not code:
+        return None
+
+    # Keep this in step with signal_web.SITE_VERIFICATION_META_KEYS: the graph
+    # uses its values as its stable, user-visible provider prefixes.
+    from sources.signal_web import SITE_VERIFICATION_META_KEYS
+
+    canonical_by_key = {
+        **SITE_VERIFICATION_META_KEYS,
+        **{canonical: canonical for canonical in SITE_VERIFICATION_META_KEYS.values()},
+        # Older DNS identifier extraction used these names.  They identify the
+        # same Google/Meta ownership proofs as the HTML tags, not a new signal.
+        "google_site_verification": "google",
+        "google_workspace": "google",
+        "facebook_domain_verification": "facebook",
+    }
+    canonical = canonical_by_key.get(provider_key)
+    return f"{canonical}|{code}" if canonical else None
+
+
+def _normalize_dns_txt_token_value(provider: Any, token: Any) -> str | None:
+    """Keep a DNS producer namespace while preserving its opaque token case."""
+    provider_key = _normalize_generic_identifier(provider)
+    code = _normalize_verification_token(token)
+    return f"{provider_key}|{code}" if provider_key and code else None
+
+
 def _normalize_identifier_value(id_type: str, value: Any) -> str | None:
     id_type = str(id_type or "").strip()
     if not id_type:
@@ -1992,6 +2053,9 @@ def _normalize_identifier_value(id_type: str, value: Any) -> str | None:
     if id_type in _IDENTIFIER_HANDLE_TYPES:
         text = _normalize_generic_identifier(value)
         return text.lstrip("@") if text else None
+    if id_type == "dns_txt_token":
+        provider, separator, token = str(value or "").partition("|")
+        return _normalize_dns_txt_token_value(provider, token) if separator else None
     if id_type == "crypto_wallet":
         # "<chain>|<address>" — only the chain half is safe to fold; see
         # sources.signal_web.normalize_crypto_address.
@@ -2082,7 +2146,7 @@ def _extract_dns_txt_token_candidates(dns: Mapping[str, Any]) -> list[tuple[str,
     for record in txt_records:
         for provider, pattern in patterns:
             for match in pattern.findall(record):
-                token = _normalize_generic_identifier(match)
+                token = _normalize_verification_token(match)
                 if token:
                     tokens.append((provider, token))
     return tokens
@@ -2314,15 +2378,22 @@ def extract_search_identifiers(result: dict[str, Any]) -> list[dict[str, Any]]:
         add(candidate, id_type="dns_caa", tier="tier_4", category="dns", source="dns.CAA", raw=value)
 
     for provider, token in _extract_dns_txt_token_candidates(dns):
-        add(f"{provider}|{token}", id_type="dns_txt_token", tier="tier_3", category="dns", source="dns.TXT")
+        add(
+            _normalize_dns_txt_token_value(provider, token),
+            id_type="dns_txt_token",
+            tier="tier_3",
+            category="dns",
+            source="dns.TXT",
+        )
 
     for token_entry in result.get("dns_txt_tokens") or result.get("dns_txt_verification_tokens") or []:
         if isinstance(token_entry, Mapping):
             provider = _normalize_generic_identifier(token_entry.get("provider")) or "unknown"
-            token = _normalize_generic_identifier(token_entry.get("token") or token_entry.get("value"))
-            if token:
+            token = _normalize_verification_token(token_entry.get("token") or token_entry.get("value"))
+            value = _normalize_dns_txt_token_value(provider, token)
+            if value:
                 add(
-                    f"{provider}|{token}",
+                    value,
                     id_type="dns_txt_token",
                     tier="tier_3",
                     category="dns",
@@ -3663,6 +3734,62 @@ def _meta_tag_site_signals(page: Mapping[str, Any]) -> tuple[dict[str, list[str]
     return verifications, handles
 
 
+def _dns_txt_site_verifications(result: Mapping[str, Any]) -> list[str]:
+    """Extract recognized ownership proofs from DNS TXT into HTML's namespace.
+
+    A provider may issue the same proof for either a meta tag or the DNS zone.
+    Their graph selector therefore has one canonical value; observations still
+    retain ``dns_txt`` versus ``self_scan`` provenance.  Structured producer
+    output is accepted alongside raw TXT for stored results from both paths.
+    """
+    values: list[str] = []
+
+    def add(provider: Any, token: Any) -> None:
+        value = normalize_site_verification_value(provider, token)
+        if value and value not in values:
+            values.append(value)
+
+    dns = result.get("dns")
+    if isinstance(dns, Mapping):
+        for record in _iter_dns_host_values(dns.get("TXT")):
+            text = _normalize_verification_token(record)
+            if not text:
+                continue
+            provider, separator, token = text.partition("=")
+            if separator:
+                add(provider, token)
+
+    for field in ("dns_txt_tokens", "dns_txt_verification_tokens"):
+        raw_entries = result.get(field)
+        if isinstance(raw_entries, Mapping):
+            if "provider" in raw_entries:
+                entries: list[Any] = [raw_entries]
+            else:
+                # Explicit provider→token maps are structured data too.  The
+                # provider name is not inferred from its token value.
+                entries = [
+                    {"provider": provider, "token": token}
+                    for provider, token in raw_entries.items()
+                ]
+        elif isinstance(raw_entries, list | tuple | set):
+            entries = list(raw_entries)
+        else:
+            entries = []
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            provider = entry.get("provider")
+            token = entry.get("token")
+            if token is None:
+                token = entry.get("value")
+            if isinstance(token, Mapping):
+                continue
+            for item in _normalize_text_list(token):
+                add(provider, item)
+
+    return values
+
+
 # Legal/imprint page signals, as selector kind -> the key each is published
 # under. An imprint is a disclosure the operator is legally obliged to make
 # about itself, so it is the densest identity source on a site: the phone and
@@ -3963,13 +4090,16 @@ def extract_selectors(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
                     add_obs(hit.get("ip"), "asn", _normalize_asn(hit.get("asn")), hit_source, ts, ts)
 
         # ── Resolved + observed IPs and their ASN / CIDR ──
-        dns = res.get("dns") or {}
+        dns = res.get("dns") if isinstance(res.get("dns"), Mapping) else {}
         for ip in _iter_dns_host_values(dns.get("A")):
             if owner:
                 add_resolves(owner, ip, "dns_a", ts, ts)
         for ip in _iter_dns_host_values(dns.get("AAAA")):
             if owner:
                 add_resolves(owner, ip, "dns_aaaa", ts, ts)
+        if owner:
+            for value in _dns_txt_site_verifications(res):
+                add_obs(owner, "site_verification", value, "dns_txt", ts, ts)
 
         ip_details = normalize_ip_details(res.get("ip_details"))
         for ip, info in ip_details.items():

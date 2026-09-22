@@ -10,16 +10,34 @@ This is a code and fixture review, not validation of the approximately 700
 ingested channels. The localhost address referred to Eoin's setup. No running
 instance or database export was available. The repository contains one saved
 `rt.com` scan dated 19 August 2026. No ingestion, rescanning, remote changes,
-deployment, or graph rebuild was performed.
+deployment, or graph rebuild was performed against Eoin's data.
+
+## Requirements for the remaining review
+
+- **Data access:** a read-only database export or access to Eoin's populated
+  instance, together with its deployed commit and ingestion scheduler settings.
+  This is required for the 10–20-channel evidence check, a populated frontend
+  audit, and measurements of rebuild time, memory and response time.
+- **Meaning of a relationship:** confirm whether the primary goal is shared
+  infrastructure, likely common operators, or both. The recommended distinction
+  is to show shared infrastructure as an observation and common operation as
+  an assessment requiring corroboration. Until confirmed, scores rank shared
+  evidence and must not be presented as ownership probabilities.
+
+These requirements do not block local fixes to missing DNS verification
+evidence, duplicate score contributions or score explanations. Weight
+calibration, historical-evidence policy, ingestion restart and hosting decisions
+remain pending the data and intended interpretation. No credentials are needed
+in this document; use an export or an authorized read-only connection.
 
 ## Findings
 
 | Priority | Finding | Evidence and action |
 | --- | --- | --- |
 | High | Live TLS observations used certificate validity dates | `extract_selectors` used `not_before`/`not_after` for certificate, SPKI and SAN observation windows. A 2020 scan with a certificate valid through 2030 received full freshness credit. Fixed live probes and origin scans to use scan time; retained certificate metadata. Existing stored projections require full recompute after deployment. |
-| High | DNS verification tokens do not reach the graph | A payload with `google-site-verification=same-token` produces a legacy identifier but zero selector observations. `extract_selectors` never emits `dns_txt_token`, although the scorer has DNS/HTML deduplication. Not fixed here: choose canonical provider names and explicit weight first; DNS currently uses `google_site_verification`, HTML uses `google`, and the DNS kind has no dedicated base weight. |
-| High | Correlated evidence can create a strong relationship alone | Two fresh, rare favicon hashes (MD5 and MMH3) score 40 + 45 = 85, with strength `strong` and displayed confidence 57. Both can describe the same icon. Consider one contribution per asset/evidence family, retaining both hashes for inspection. Certificate, public-key and SAN overlap warrants the same review. Do not treat these as independent confirmations. |
-| Medium | Percentages suggest more certainty than established | Confidence is `round(100 * score / (score + 65))`, not a probability fitted to reviewed pairs. At score 13,000 it rounded to 100 despite its documented promise never to imply certainty. Fixed rounding to cap at 99; calibration and UI wording remain open. |
+| High | DNS verification tokens did not reach the graph | Fixed locally: recognized DNS proofs now use HTML's canonical `site_verification` selector and existing 92-point base weight. Case-sensitive tokens remain distinct; identical DNS/HTML proofs share one contribution and retain both sources. Unknown providers stay in the identifier layer. Existing data needs full recompute. |
+| High | Correlated evidence could create a strong relationship alone | Fixed locally with a conservative family cap: only the strongest adjusted favicon match and strongest adjusted TLS match contribute per pair. Two favicon hashes now score 45 instead of 85, producing moderate evidence. Certificate/key/SAN matches no longer add together; every row remains inspectable with its contribution and explanation. Independent assets within a family are also capped until asset-level provenance is available. |
+| Medium | Percentages suggest more certainty than established | Confidence is an uncalibrated score transformation. Rounding is capped at 99, and cards/printable reports now show raw Match score and evidence-strength labels instead of percentages. The API/CSV confidence field remains for compatibility. Calibration still requires reviewed pairs. |
 | Medium | Historical evidence still needs a separate temporal policy | CT SANs still use validity dates, whereas provider IP hits generally use collection time. Fetching historical evidence today does not establish that it is currently deployed. Keep issuance, provider observation and retrieval times distinct before interpreting freshness across sources. The live-probe correction does not resolve this broader issue. |
 | Medium | Cluster membership and scored links have different rules | `rebuild_clusters` joins connected components through eligible selectors/IPs with fanout 2–25, without applying the link's score or recency. Pairwise scores use other thresholds and degree rules. A shared weak signal can create cluster membership; a high-fanout identity signal may link domains without joining their clusters. This may be intentional but must be explained to analysts. |
 
@@ -33,10 +51,11 @@ Current examples before rarity/time penalties are TLS certificate 200,
 AdSense 190, GA property 170, SSH key 95, verification token 92, IP 85,
 nameserver 25 and ASN 15. A TLS certificate alone scores about 75% on the
 displayed scale. That is a ranking convention, not 75% ownership certainty.
-The 65-point strong threshold also lets several weak or redundant observations
-cross into strong without independent evidence.
+The 65-point strong threshold still lets several weak observations cross into
+strong. The family caps remove obvious redundant contributions, but do not
+establish that all remaining observations are independent.
 
-Keep the weights unchanged until reviewed positive and negative examples are
+Keep the base weights unchanged until reviewed positive and negative examples are
 available. In particular, test shared hosting, common templates, agency-managed
 analytics, expired evidence, redirects, and default virtual hosts. Shared
 infrastructure should be distinguished from shared administration and ownership.
@@ -45,16 +64,18 @@ TLS relaying can also expose a genuine certificate on someone else's host;
 
 ## Frontend recommendations
 
-These are source-based recommendations, not a visual or accessibility audit.
-No screenshots or populated UI interactions were possible without the instance.
+These are source-based recommendations, not a visual or accessibility audit of
+Eoin's collection. The follow-up changes were checked in the in-app browser
+using two synthetic channels; the actual collection remains unavailable.
 
-1. Connection cards prominently show a percentage and strength badge
-   (`frontend/src/features/evidence.jsx`). Label the number as a heuristic match
-   score and explain that it is not an ownership probability. Make the strongest
-   independent evidence and observation dates immediately visible.
+1. Implemented locally: connection cards and printable reports label raw Match
+   score, explain that it is not an ownership probability, and retain observation
+   dates in expanded evidence. Adjusted contributions explain which related
+   measurements added no points. Further layout decisions await the real dataset.
 2. Distinguish direct shared evidence, a multi-hop path and cluster membership.
-   The existing step-by-step path cards are a useful foundation; a path must not
-   imply that its endpoints share an operator.
+   The step-by-step path cards and printable report now explain that each score
+   applies to its own pair, not the endpoints of the whole chain. Cluster
+   membership semantics still require the intended relationship definition.
 3. Show provider/collection failures alongside evidence coverage. Missing data
    must be distinguishable from a scan that found no match. The saved scan, for
    example, contains a CIRCL HTTP 401 error.
@@ -110,6 +131,34 @@ Should historic relationships remain prominent? What evidence justifies a
 interval and response-time targets should determine ingestion and hosting?
 
 ## Verification
+
+The initial review ran the focused checks below without PostgreSQL. Follow-up
+verification used a disposable PostgreSQL 16 container and covered DNS
+projection/persistence, cross-DNS/HTML matches, case-sensitive proofs,
+contribution caps, graph maintenance and existing storage regressions:
+**88 tests and six subtests passed, with no skips.** The
+frontend production build passed. React Doctor reported existing patterns in
+changed files (fetching in effects, chained array operations, formatter creation
+and mixed exports); this change did not add those patterns, and they were left
+outside scope.
+
+The synthetic browser check verified the collapsed Match score card and expanded
+evidence: one DNS/HTML proof contributes 92 points, one favicon contributes 45,
+and its other hash remains visible with 0 points and a scoring explanation.
+Bundled frontend assertions checked printable-report wording, CSV compatibility,
+normalization of zero contributions and the legacy confidence cap. The temporary
+browser tab, server and database are removed after verification.
+
+`npm ci` initially failed because the lockfile omitted optional platform packages.
+The lockfile repair added those entries without changing existing locked package
+versions or declared dependencies. It is included so clean installations work.
+The read-only `codex-review --mode auto` closeout reported no actionable findings.
+
+The full suite, real-data replay, populated-collection UX audit and production
+load testing remain unperformed. A full graph recompute is still required on an
+authorized deployment before existing cached relationships reflect these fixes.
+
+### Initial review checks
 
 Focused command: `.venv/bin/python -m pytest tests/test_graph_linkage.py tests/test_graph_maintenance.py -q`.
 Result: 31 passed, 21 skipped, six TLS-source subtests passed. Database-dependent

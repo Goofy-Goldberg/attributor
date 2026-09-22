@@ -303,6 +303,29 @@ strength tiers live in `utils/evidence_meta.py`; the linkage/scoring engine is i
 `utils/check.py` (`link_evidence`, `links_for`); clustering is connected
 components over the whole attributing graph (`graph_clusters`).
 
+Related measurements do not add independent points: each pair receives only
+the strongest adjusted contribution from its favicon matches and only the
+strongest from its TLS certificate/fingerprint/public-key/SAN matches. All
+matches remain in the evidence breakdown. `weight` is the actual contribution;
+`raw_weight`, `evidence_group` and `scoring_note` explain adjustments. This is
+a conservative family-level cap because stored selectors do not reliably
+identify independent assets. It also caps repeated certificates or favicons
+within the same family; independent evidence from other families still adds.
+
+Recognized DNS TXT verification proofs now share the `site_verification`
+selector namespace and existing weight with HTML verification codes. Provider
+aliases are normalized, token case is preserved, and DNS/HTML observations keep
+their source labels. Publishing the same proof in both places contributes once,
+including when one site publishes it in DNS and the other in HTML. Unknown DNS
+providers remain available as identifiers without gaining verification weight.
+Run a full graph recompute after deployment to replace older lowercased selector
+values, project stored DNS evidence and refresh cached scores and paths.
+
+The interface and printable reports show a raw **Match score**, with no upper
+limit, and evidence-strength labels. These rank shared evidence, not the
+probability of common ownership. The legacy API/CSV `confidence` field is kept
+for compatibility and remains an uncalibrated transformation of that score.
+
 A configurable **denylist** marks selectors non-attributing — known CDN/cloud
 ASNs, big-provider nameservers, default/shared-host cert SANs, and any selector
 whose degree exceeds `CORRELATION_DEGREE_THRESHOLD` (default 50). Denylisted
