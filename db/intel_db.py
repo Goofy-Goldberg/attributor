@@ -3921,13 +3921,14 @@ def extract_selectors(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
         for cert in tls_list:
             if not isinstance(cert, Mapping) or cert.get("error"):
                 continue
-            nb, na = _safe_iso(cert.get("not_before")), _safe_iso(cert.get("not_after"))
             fingerprint = cert.get("sha256") or cert.get("fingerprint_sha256")
             if owner:
-                add_obs(owner, "tls_cert_sha256", _normalize_identifier_hash(fingerprint), "self_scan", nb, na)
-                add_obs(owner, "tls_spki", _normalize_identifier_hash(cert.get("spki_sha256")), "self_scan", nb, na)
+                # CA validity is certificate metadata, not proof that this host
+                # served the certificate throughout that interval.
+                add_obs(owner, "tls_cert_sha256", _normalize_identifier_hash(fingerprint), "self_scan", ts, ts)
+                add_obs(owner, "tls_spki", _normalize_identifier_hash(cert.get("spki_sha256")), "self_scan", ts, ts)
                 for san in cert.get("sans") or []:
-                    add_obs(owner, "tls_san", _normalize_tls_identity(san), "self_scan", nb, na)
+                    add_obs(owner, "tls_san", _normalize_tls_identity(san), "self_scan", ts, ts)
             if cert.get("ip") and owner:
                 add_resolves(owner, cert.get("ip"), "tls", ts, ts)
 
@@ -3939,12 +3940,11 @@ def extract_selectors(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
             for hit in scan_result.get("hits") or []:
                 if not isinstance(hit, Mapping):
                     continue
-                nb, na = _safe_iso(hit.get("not_before")), _safe_iso(hit.get("not_after"))
                 if owner:
-                    add_obs(owner, "tls_cert_sha256", _normalize_identifier_hash(hit.get("sha256")), scan_src, nb, na)
-                    add_obs(owner, "tls_spki", _normalize_identifier_hash(hit.get("spki_sha256")), scan_src, nb, na)
+                    add_obs(owner, "tls_cert_sha256", _normalize_identifier_hash(hit.get("sha256")), scan_src, ts, ts)
+                    add_obs(owner, "tls_spki", _normalize_identifier_hash(hit.get("spki_sha256")), scan_src, ts, ts)
                     for san in hit.get("sans") or []:
-                        add_obs(owner, "tls_san", _normalize_tls_identity(san), scan_src, nb, na)
+                        add_obs(owner, "tls_san", _normalize_tls_identity(san), scan_src, ts, ts)
                     if hit.get("ip"):
                         add_resolves(owner, hit.get("ip"), scan_src, ts, ts)
 

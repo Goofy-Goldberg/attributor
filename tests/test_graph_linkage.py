@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 
@@ -23,6 +24,12 @@ def _database_unreachable_reason() -> str | None:
 
 class GraphScoringMathTests(unittest.TestCase):
     """Pure scoring math — no database."""
+
+    def test_confidence_never_rounds_up_to_certainty(self) -> None:
+        self.assertEqual(check.confidence_from_score(0), 0)
+        self.assertEqual(check.confidence_from_score(200), 75)
+        self.assertEqual(check.confidence_from_score(13000), 99)
+        self.assertEqual(check.confidence_from_score(1000000), 99)
 
     def test_rarity_decays_with_degree(self) -> None:
         self.assertEqual(check.rarity_weight(2), 1.0)
@@ -58,6 +65,38 @@ class ProjectionTests(unittest.TestCase):
 
     def _obs(self, result: dict, kind: str) -> list[dict]:
         return [o for o in self._project(result)["observations"] if o["kind"] == kind]
+
+    def test_live_tls_windows_use_observation_time_not_certificate_validity(self) -> None:
+        observed = (datetime.now(timezone.utc) - timedelta(days=1000)).isoformat()
+        cert = {
+            "sha256": "ab" * 32, "fingerprint_sha256": "ab" * 32,
+            "spki_sha256": "cd" * 32, "sans": ["example.com"],
+            "not_before": "2010-01-01T00:00:00+00:00",
+            "not_after": "2099-01-01T00:00:00+00:00",
+        }
+        sources = [
+            {"tls_certs": {"probes": [cert]}},
+            {"non_cf_tls_certs": [cert]},
+            {"tls_cert": cert},
+            *({"origin_candidates": {kind: {"hits": [cert]}}}
+              for kind in ("scan", "provider_scan", "country_scan")),
+        ]
+        for source in sources:
+            with self.subTest(source=source):
+                observations = self._project({"timestamp": observed, **source})["observations"]
+                tls = [o for o in observations if o["kind"] in {"tls_cert_sha256", "tls_spki", "tls_san"}]
+                self.assertEqual(len(tls), 3)
+                for observation in tls:
+                    self.assertEqual(observation["first_seen"], observed)
+                    self.assertEqual(observation["last_seen"], observed)
+                row = next(o for o in tls if o["kind"] == "tls_cert_sha256")
+                evidence, weight = check._score_selector_row({
+                    **row, "entity_count": 2,
+                    "a_first": row["first_seen"], "a_last": row["last_seen"],
+                    "b_first": row["first_seen"], "b_last": row["last_seen"],
+                })
+                self.assertEqual(evidence["recency"], check._RECENCY_FLOOR)
+                self.assertLess(weight, evidence["base_weight"])
 
     # ── WHOIS registrant identity ──
     def test_registrant_email_lands_on_contact_email(self) -> None:

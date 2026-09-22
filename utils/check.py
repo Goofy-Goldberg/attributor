@@ -129,7 +129,7 @@ def confidence_from_score(score: int | float) -> int:
     band.
     """
     s = max(0, float(score or 0))
-    return int(round(100 * s / (s + 65)))
+    return min(99, int(round(100 * s / (s + 65))))
 
 
 # ── Global graph linkage (selector-centric attribution) ─────────────────────

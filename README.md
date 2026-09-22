@@ -296,7 +296,7 @@ leaf certificate, `a.com` and `b.com` link through the subdomains):
 
 Two registrable domains link when they share an **attributing** selector or a
 non-noise shared IP. Each shared node is scored by **base weight × rarity ×
-time-overlap**: rarity is `1/log2(degree)` (a cert shared by 2 entities is huge;
+time-overlap × recency**: rarity is `1/log2(degree)` (a cert shared by 2 entities is huge;
 a nameserver/ASN shared by 40,000 is ~noise), and observation windows that
 overlap score higher than the same selector seen years apart. Base weights and
 strength tiers live in `utils/evidence_meta.py`; the linkage/scoring engine is in
@@ -317,6 +317,14 @@ means one account owns many domains, which is the finding itself: applying the
 infrastructure cutoff would discard a broadcaster's own verification code
 exactly because it covers the whole network being investigated. Rarity weighting
 still applies, so a wide token degrades smoothly rather than at a cliff.
+
+Live TLS probes and origin scans use the scan timestamp for certificate,
+public-key and SAN observation windows. Certificate validity dates remain
+metadata; they do not establish when a host served a certificate. Deployments
+with older projections need a full graph recompute from stored intel to replace
+the previous validity-based windows. Link confidence is a heuristic score,
+not a calibrated probability of common ownership, and is capped at 99 after
+rounding so it never claims certainty.
 
 #### Multi-hop path precompute
 
