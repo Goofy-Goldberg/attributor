@@ -147,8 +147,13 @@ export function JobsProvider({ children, userId }) {
         poolListeners.current.forEach((listener) => listener(job.id));
         if (job.createdBy === userId) {
           const failed = job.status.includes("fail") || job.status.includes("error");
+          const partial = job.status.includes("partial");
           if (failed) {
             toast.error("Scan failed", { description: job.summary || `Scan ${job.id} did not finish.` });
+          } else if (partial) {
+            toast.warning("Scan finished with gaps", {
+              description: job.summary || "Some targets or providers did not complete.",
+            });
           } else {
             toast.success("Scan finished", {
               description: job.failedTargets

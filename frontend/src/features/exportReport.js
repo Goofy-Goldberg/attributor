@@ -65,6 +65,44 @@ function verdictDetails(summary) {
     .join("; ");
 }
 
+// `coverage` is deliberately part of the export contract. Screens pass the
+// exact server totals and any path traversal limit they received, so a file
+// remains honest after it leaves the application.
+export function describeExportCoverage(coverage) {
+  if (!coverage) {
+    return "This export contains the relationships loaded on screen.";
+  }
+  const notes = [];
+  const direct = coverage.direct;
+  if (direct?.hasMore) {
+    notes.push(direct.total == null
+      ? `This export includes ${direct.shown ?? 0} loaded direct connections; more pool connections were not loaded.`
+      : `It includes ${direct.shown ?? 0} of ${direct.total} direct connections.`);
+  }
+  const paths = coverage.paths;
+  if (paths?.hasMore) {
+    notes.push(`Only ${paths.shown ?? 0} of ${paths.total} precomputed paths were loaded before this export.`);
+  }
+  if (paths?.partial) {
+    const limits = paths.pathLimits || {};
+    const details = [];
+    if (limits.max_hops) details.push(`up to ${limits.max_hops} hops`);
+    if (limits.max_nodes) details.push(`${limits.max_nodes} reachable channels per source`);
+    if (limits.frontier_limit) details.push(`${limits.frontier_limit} direct links per step`);
+    notes.push(`Some possible paths were not checked${details.length ? ` (${details.join(", ")})` : ""}.`);
+  }
+  if (paths?.failed) {
+    notes.push("Some precomputed path lookups failed, so indirect connections may be missing.");
+  }
+  if (paths?.stale) {
+    notes.push("The path index was waiting for its next rebuild, so newer connections may be absent.");
+  }
+  if (coverage.selection?.truncated) {
+    notes.push(`The graph scored ${coverage.selection.shown ?? 0} of ${coverage.selection.total} selected channels.`);
+  }
+  return notes.length > 0 ? notes.join(" ") : "This export contains the relationships loaded on screen.";
+}
+
 // Each score describes one pairwise match in the chain, not the endpoints.
 function describeChainLines(chain) {
   return (chain || []).map((hop) => {
@@ -80,6 +118,7 @@ function describeChainLines(chain) {
 // relationships found via /api/graph/path or /api/graph/related/*.
 export function buildReportHtml(scope) {
   const { title, domains = [], pairs = [], chains = [] } = scope || {};
+  const coverage = describeExportCoverage(scope?.coverage);
   const connectedPairs = pairs.filter((pair) => pair.connected);
 
   const pairSentences = connectedPairs
@@ -134,6 +173,7 @@ export function buildReportHtml(scope) {
   <h1>${escapeHtml(title || "Connection report")}</h1>
   <p class="meta">Generated ${escapeHtml(todayLabel())}</p>
   <p class="domains">Channels covered: ${domains.map((d) => escapeHtml(d)).join(", ")}</p>
+  <p class="domains">${escapeHtml(coverage)}</p>
   <p>A higher match score means more shared evidence. It is not a probability of common ownership.</p>
 
   <h2>Direct connections (${connectedPairs.length})</h2>
@@ -188,6 +228,7 @@ const CSV_HEADER = [
   "different_owner_verdicts",
   "unsure_verdicts",
   "analyst_verdicts",
+  "coverage",
 ];
 
 function verdictCsvFields(summary) {
@@ -203,6 +244,7 @@ function verdictCsvFields(summary) {
 // gets a single summary row.
 export function buildReportCsv(scope) {
   const { pairs = [], chains = [] } = scope || {};
+  const coverage = describeExportCoverage(scope?.coverage);
   const rows = [CSV_HEADER.join(",")];
 
   pairs
@@ -211,7 +253,7 @@ export function buildReportCsv(scope) {
       const evidence = pair.evidence || [];
       if (evidence.length === 0) {
         rows.push(
-          [pair.a, pair.b, 1, Math.round(pair.score ?? 0), pair.confidence ?? "", pair.strength ?? "", "", "", ...verdictCsvFields(pair.verdictSummary)]
+          [pair.a, pair.b, 1, Math.round(pair.score ?? 0), pair.confidence ?? "", pair.strength ?? "", "", "", ...verdictCsvFields(pair.verdictSummary), coverage]
             .map(csvField)
             .join(","),
         );
@@ -219,7 +261,7 @@ export function buildReportCsv(scope) {
       }
       evidence.forEach((node) => {
         rows.push(
-          [pair.a, pair.b, 1, Math.round(pair.score ?? 0), pair.confidence ?? "", pair.strength ?? "", node.kind, node.value, ...verdictCsvFields(pair.verdictSummary)]
+          [pair.a, pair.b, 1, Math.round(pair.score ?? 0), pair.confidence ?? "", pair.strength ?? "", node.kind, node.value, ...verdictCsvFields(pair.verdictSummary), coverage]
             .map(csvField)
             .join(","),
         );
@@ -231,7 +273,7 @@ export function buildReportCsv(scope) {
       const evidence = hop.evidence && hop.evidence.length > 0 ? hop.evidence : [{ kind: "", value: "" }];
       evidence.forEach((node) => {
         rows.push(
-          [entry.a, entry.b, entry.hops, Math.round(hop.score ?? 0), hop.confidence ?? "", hop.strength ?? "", node.kind, node.value, ...verdictCsvFields(hop.verdictSummary)]
+          [entry.a, entry.b, entry.hops, Math.round(hop.score ?? 0), hop.confidence ?? "", hop.strength ?? "", node.kind, node.value, ...verdictCsvFields(hop.verdictSummary), coverage]
             .map(csvField)
             .join(","),
         );
@@ -239,13 +281,20 @@ export function buildReportCsv(scope) {
     });
   });
 
+  if (rows.length === 1) {
+    rows.push(Array(CSV_HEADER.length - 1).fill("").concat(coverage).map(csvField).join(","));
+  }
+
   // CRLF: Excel on Windows mis-parses LF-only files containing quoted
   // multi-line fields, which evidence strings can be.
   return rows.join("\r\n");
 }
 
 export function buildReportJson(scope) {
-  return JSON.stringify(scope || {}, null, 2);
+  return JSON.stringify({
+    ...(scope || {}),
+    exportCoverage: describeExportCoverage(scope?.coverage),
+  }, null, 2);
 }
 
 export function downloadReportCsv(scope, filenameBase = "connection-report") {

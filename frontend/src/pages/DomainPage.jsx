@@ -6,9 +6,9 @@ import {
   formatDate,
   formatLabel,
   formatNumber,
-  normalizeGraphLinks,
+  normalizeGraphLinkPage,
   normalizeGraphPath,
-  normalizeRelatedThrough,
+  normalizeRelatedThroughPage,
   useApi,
 } from "@/api.js";
 import { EmptyState, ErrorState, LoadingState, Section, SkeletonRows, Stat } from "@/components/page.jsx";
@@ -52,13 +52,14 @@ export default function DomainPage() {
   const linksRequest = useApi(`/api/graph/links/${encodeURIComponent(value)}`);
   const profile = profileRequest.data;
   const [savedVerdicts, setSavedVerdicts] = useState(new Map());
+  const linksPage = useMemo(() => normalizeGraphLinkPage(linksRequest.data), [linksRequest.data]);
   const links = useMemo(
     () =>
-      normalizeGraphLinks(linksRequest.data).map((link) => ({
+      linksPage.links.map((link) => ({
         ...link,
         verdictSummary: savedVerdicts.get(pairVerdictKey(value, link.target)) || link.verdictSummary,
       })),
-    [linksRequest.data, savedVerdicts, value],
+    [linksPage, savedVerdicts, value],
   );
   const handleVerdictSaved = useCallback(({ a, b, summary }) => {
     setSavedVerdicts((current) => new Map(current).set(pairVerdictKey(a, b), summary));
@@ -75,8 +76,9 @@ export default function DomainPage() {
       domains: [value],
       pairs: links.map((link) => ({ ...link, a: value, b: link.target, connected: true })),
       chains: [],
+      coverage: { direct: { shown: links.length, total: linksPage.total, hasMore: linksPage.hasMore } },
     }),
-    [value, links],
+    [value, links, linksPage],
   );
 
   const setTab = (next) =>
@@ -151,7 +153,7 @@ export default function DomainPage() {
         <>
           <Card className="py-4">
             <CardContent className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-              <Stat label="Connections" value={linksRequest.data ? formatNumber(links.length) : "…"} />
+              <Stat label="Connections" value={linksRequest.data ? formatNumber(linksPage.total) : "…"} />
               <Stat label="Hosts" value={formatNumber(profile.host_count || 0)} />
               <Stat label="IP addresses" value={formatNumber((profile.ips || []).length)} />
               <Stat label="Last scan" value={intel?.timestamp ? new Date(intel.timestamp).toLocaleDateString(undefined, { dateStyle: "medium" }) : "—"} />
@@ -161,7 +163,7 @@ export default function DomainPage() {
           <Tabs onValueChange={setTab} value={tab}>
             <TabsList className="h-auto flex-wrap justify-start" variant="line">
               <TabsTrigger value="connections">
-                Connections <CountBadge value={links.length} />
+                Connections <CountBadge value={linksPage.total} />
               </TabsTrigger>
               <TabsTrigger value="evidence">
                 Extracted evidence <CountBadge value={selectorCount} />
@@ -173,7 +175,7 @@ export default function DomainPage() {
             </TabsList>
 
             <TabsContent className="flex flex-col gap-8 pt-4" value="connections">
-              <DirectConnections links={links} onVerdictSaved={handleVerdictSaved} request={linksRequest} value={value} />
+              <DirectConnections hasMore={linksPage.hasMore} links={links} onVerdictSaved={handleVerdictSaved} request={linksRequest} total={linksPage.total} value={value} />
               <RelatedThroughSection directTargets={directTargets} value={value} />
               <FindPathSection value={value} />
             </TabsContent>
@@ -207,7 +209,7 @@ function CountBadge({ value }) {
   );
 }
 
-function DirectConnections({ value, links, onVerdictSaved, request }) {
+function DirectConnections({ value, links, onVerdictSaved, request, total, hasMore }) {
   const [showAll, setShowAll] = useState(false);
   const visible = showAll ? links : links.slice(0, INITIAL_CONNECTIONS);
 
@@ -236,9 +238,10 @@ function DirectConnections({ value, links, onVerdictSaved, request }) {
               otherwise. */}
           {links.length > INITIAL_CONNECTIONS ? (
             <Button className="self-center" onClick={() => setShowAll((current) => !current)} variant="outline">
-              {showAll ? "Show the strongest 25" : `Show all ${links.length} connections`}
+              {showAll ? "Show the strongest 25" : `Show all ${links.length} loaded connections`}
             </Button>
           ) : null}
+          {hasMore ? <p className="text-muted-foreground text-sm">Showing {links.length} of {total} direct connections.</p> : null}
         </div>
       ) : null}
     </Section>
@@ -248,23 +251,62 @@ function DirectConnections({ value, links, onVerdictSaved, request }) {
 // A channel's precomputed multi-hop neighbourhood (db.intel_db.graph_paths) —
 // domains reachable only through an intermediary, not shared directly. Always
 // an instant indexed read, never a traversal triggered by opening this page.
-function RelatedThroughSection({ value, directTargets }) {
-  const relatedRequest = useApi(`/api/graph/related/${encodeURIComponent(value)}`);
+const RELATED_THROUGH_SECTION_PROPS = {
+  description: "No direct evidence, but reachable through an intermediary channel. Precomputed, not a guess.",
+  title: "Indirect connections",
+};
+
+export function RelatedThroughSection({ value, directTargets }) {
+  const relatedRequest = useApi(`/api/graph/related/${encodeURIComponent(value)}?min_hops=2`);
+  const relatedPage = useMemo(() => normalizeRelatedThroughPage(relatedRequest.data), [relatedRequest.data]);
   const related = useMemo(
-    () => normalizeRelatedThrough(relatedRequest.data).filter((entry) => entry.hops > 1 && !directTargets.has(entry.target)),
-    [relatedRequest.data, directTargets],
+    () => relatedPage.related.filter((entry) => entry.hops > 1 && !directTargets.has(entry.target)),
+    [relatedPage, directTargets],
   );
 
-  if (related.length === 0) {
+  const hasData = relatedRequest.data !== null && relatedRequest.data !== undefined;
+  if (relatedRequest.error) {
+    return (
+      <Section {...RELATED_THROUGH_SECTION_PROPS}>
+        <ErrorState message={relatedRequest.error} title="Could not load indirect connections" />
+      </Section>
+    );
+  }
+
+  if (relatedRequest.loading && !hasData) {
+    return (
+      <Section {...RELATED_THROUGH_SECTION_PROPS}>
+        <SkeletonRows rows={3} />
+      </Section>
+    );
+  }
+
+  if (hasData && related.length === 0) {
+    return (
+      <Section {...RELATED_THROUGH_SECTION_PROPS}>
+        <EmptyState
+          description={relatedPage.hasMore
+            ? "No indirect connection appears on this page. More precomputed paths are available."
+            : relatedPage.partial || relatedPage.stale
+              ? "No indirect connection appears in the available paths. The path search was limited or is waiting for a refresh."
+              : "No precomputed multi-hop paths remain after direct connections are removed."}
+          icon={RouteIcon}
+          title={relatedPage.hasMore || relatedPage.partial || relatedPage.stale ? "No path in current results" : "No indirect connections"}
+        />
+      </Section>
+    );
+  }
+
+  if (!hasData) {
     return null;
   }
 
   return (
-    <Section
-      description="No direct evidence, but reachable through an intermediary channel. Precomputed, not a guess."
-      title="Indirect connections"
-    >
+    <Section {...RELATED_THROUGH_SECTION_PROPS}>
       <div className="flex flex-col gap-2">
+        {relatedPage.partial || relatedPage.stale ? (
+          <p className="text-muted-foreground text-sm">These paths may be incomplete{relatedPage.stale ? " until the path index refreshes" : " because the search reached its limits"}.</p>
+        ) : null}
         {related.slice(0, 20).map((entry) => (
           <Collapsible className="bg-card rounded-lg border" key={entry.target}>
             <CollapsibleTrigger asChild>
@@ -287,8 +329,8 @@ function RelatedThroughSection({ value, directTargets }) {
             </CollapsibleContent>
           </Collapsible>
         ))}
-        {related.length > 20 ? (
-          <p className="text-muted-foreground text-xs">Showing 20 of {related.length} indirect connections.</p>
+        {related.length > 20 || relatedPage.hasMore ? (
+          <p className="text-muted-foreground text-xs">Showing {Math.min(20, related.length)} of {relatedPage.total} available indirect connections.</p>
         ) : null}
       </div>
     </Section>

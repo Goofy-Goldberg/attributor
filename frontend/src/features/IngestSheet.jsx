@@ -215,8 +215,12 @@ function JobRow({ job, snapshot, showCreator = false }) {
   const status = snapshot?.status || job.status;
   const terminal = isTerminalStatus(status);
   const failed = status.includes("fail") || status.includes("error");
+  const partial = status.includes("partial");
   const percent = terminal ? 100 : (snapshot?.percent ?? 0);
   const recentLogs = (snapshot?.logs || []).slice(-3);
+  const providerRows = snapshot?.providerCoverage?.providers || [];
+  const providerFailures = providerRows.reduce((count, row) => count + (row.failed?.length || 0), 0);
+  const providerSkips = providerRows.reduce((count, row) => count + (row.skipped?.length || 0), 0);
 
   return (
     <div className="flex flex-col gap-2 rounded-lg border p-3">
@@ -232,8 +236,8 @@ function JobRow({ job, snapshot, showCreator = false }) {
         </div>
         {terminal ? (
           <Badge variant={failed ? "destructive" : "secondary"}>
-            {failed ? <CircleAlertIcon data-icon="inline-start" /> : <CheckCircle2Icon data-icon="inline-start" />}
-            {failed ? "Failed" : "Done"}
+            {failed || partial ? <CircleAlertIcon data-icon="inline-start" /> : <CheckCircle2Icon data-icon="inline-start" />}
+            {failed ? "Failed" : partial ? "Partial" : "Done"}
           </Badge>
         ) : (
           <Badge variant="outline">
@@ -262,6 +266,14 @@ function JobRow({ job, snapshot, showCreator = false }) {
       ) : null}
       {snapshot?.failedTargets ? (
         <span className="text-destructive text-xs">{snapshot.failedTargets} target(s) failed.</span>
+      ) : null}
+      {snapshot?.partialTargets ? (
+        <span className="text-muted-foreground text-xs">{snapshot.partialTargets} target(s) have partial provider coverage.</span>
+      ) : null}
+      {providerFailures || providerSkips ? (
+        <span className="text-muted-foreground text-xs">
+          Provider coverage: {providerFailures} failed, {providerSkips} skipped.
+        </span>
       ) : null}
     </div>
   );

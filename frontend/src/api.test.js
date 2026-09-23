@@ -7,10 +7,12 @@ import {
   normalizeExplorerGraph,
   normalizeGraphClusters,
   normalizeGraphLinks,
+  normalizeGraphLinkPage,
   normalizeGraphPath,
   normalizeJob,
   normalizePool,
   normalizeRelatedThrough,
+  normalizeRelatedThroughPage,
   normalizeSearchResults,
   normalizeSelectorGroups,
   normalizeSelectorKinds,
@@ -52,7 +54,9 @@ describe("API payload normalizers", () => {
       percent: 40,
       total_targets: 5,
       completed_targets: 2,
+      partial_targets: 1,
       failed_targets: 1,
+      provider_coverage: { providers: [{ provider: "censys", skipped: [{ target: "followup.example" }] }] },
       label: "Election sites",
       created_by: "analyst-1",
       created_by_display: "Alex",
@@ -62,7 +66,9 @@ describe("API payload normalizers", () => {
       id: "scan-8",
       totalTargets: 5,
       completedTargets: 2,
+      partialTargets: 1,
       failedTargets: 1,
+      providerCoverage: expect.objectContaining({ providers: [expect.objectContaining({ provider: "censys" })] }),
       label: "Election sites",
       createdBy: "analyst-1",
       createdByDisplay: "Alex",
@@ -112,6 +118,12 @@ describe("API payload normalizers", () => {
     });
     expect(confidenceFromScore(65)).toBe(50);
     expect(confidenceFromScore("bad")).toBe(0);
+  });
+
+  it("keeps graph-list totals and truncation separate from rendered links", () => {
+    expect(normalizeGraphLinkPage({
+      links: [{ target: "beta.example" }], total: 51, limit: 50, has_more: true,
+    })).toMatchObject({ total: 51, limit: 50, hasMore: true, links: [expect.objectContaining({ target: "beta.example" })] });
   });
 
   it("normalizes embedded and endpoint verdict summaries", () => {
@@ -263,5 +275,9 @@ describe("API payload normalizers", () => {
     ).toEqual([
       expect.objectContaining({ target: "gamma.example", hops: 2, minHopScore: 30, chain: [expect.objectContaining({ from: "alpha.example", to: "beta.example" })] }),
     ]);
+    expect(normalizeRelatedThroughPage({
+      related: [{ target: "gamma.example", hops: 2, chain: [] }], total: 61, limit: 50,
+      has_more: true, partial: true, stale: true, path_limits: { max_hops: 3 },
+    })).toMatchObject({ total: 61, hasMore: true, partial: true, stale: true, pathLimits: { max_hops: 3 } });
   });
 });

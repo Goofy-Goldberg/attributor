@@ -11,11 +11,12 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { downloadReportCsv, downloadReportJson, printReport } from "@/features/exportReport.js";
+import { describeExportCoverage, downloadReportCsv, downloadReportJson, printReport } from "@/features/exportReport.js";
 
 // A point-in-time report of exactly what is on screen (direct pairs plus any
 // multi-hop chains), for someone who does not need to open the tool.
 export default function ExportMenu({ scope, disabled = false }) {
+  const coverage = describeExportCoverage(scope?.coverage);
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -26,6 +27,7 @@ export default function ExportMenu({ scope, disabled = false }) {
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-56">
         <DropdownMenuLabel>Share these findings</DropdownMenuLabel>
+        <p className="text-muted-foreground px-2 pb-2 text-xs">{coverage}</p>
         <DropdownMenuSeparator />
         <DropdownMenuGroup>
           <DropdownMenuItem

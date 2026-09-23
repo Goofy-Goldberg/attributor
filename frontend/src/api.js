@@ -403,6 +403,7 @@ export function normalizeJob(payload, fallbackId = null) {
     completedSteps:
       pickFirst(raw, ["completed_steps", "completedSteps", "counts.completed"], null) ?? null,
     totalSteps: pickFirst(raw, ["total_steps", "totalSteps", "counts.total"], null) ?? null,
+    partialTargets: pickFirst(raw, ["partial_targets", "partialTargets", "counts.partial"], null) ?? null,
     failedTargets: pickFirst(raw, ["failed_targets", "failedTargets", "counts.failed"], null) ?? null,
     totalTargets: pickFirst(raw, ["total_targets", "totalTargets"], null),
     completedTargets: pickFirst(raw, ["completed_targets", "completedTargets"], null),
@@ -413,6 +414,8 @@ export function normalizeJob(payload, fallbackId = null) {
     startedAt: pickFirst(raw, ["started_at", "startedAt", "created_at", "createdAt"], null),
     finishedAt: pickFirst(raw, ["finished_at", "finishedAt"], null),
     updatedAt: pickFirst(raw, ["updated_at", "updatedAt", "last_seen_at", "lastSeenAt"]),
+    providerCoverage: pickFirst(raw, ["provider_coverage", "providerCoverage", "case_summary.provider_coverage"], null),
+    targetOutcomes: coerceArray(pickFirst(raw, ["target_outcomes", "targetOutcomes", "case_summary.target_outcomes"], [])),
     logs: normalizeLogLines(pickFirst(raw, ["logs", "events", "messages"], [])),
     steps,
   };
@@ -433,6 +436,22 @@ export function confidenceFromScore(score) {
 
 export function normalizeGraphLinks(payload) {
   return coerceArray(payload?.links ?? payload).map((item, index) => normalizeGraphLink(item, index));
+}
+
+// Keep the list-only normalizer above for callers that only render links, and
+// expose page metadata separately for screens that need to disclose a cap.
+export function normalizeGraphLinkPage(payload) {
+  const links = normalizeGraphLinks(payload);
+  const reportedTotal = Number(payload?.total);
+  const total = Number.isFinite(reportedTotal) && reportedTotal >= links.length ? reportedTotal : links.length;
+  const reportedLimit = Number(payload?.limit);
+  const limit = Number.isFinite(reportedLimit) && reportedLimit > 0 ? reportedLimit : links.length;
+  return {
+    links,
+    total,
+    limit,
+    hasMore: Boolean(payload?.has_more ?? payload?.hasMore) || total > links.length,
+  };
 }
 
 export function normalizeGraphLink(item, index = 0) {
@@ -837,6 +856,9 @@ export function normalizeGraphPath(payload) {
     b: readableValue(pickFirst(raw, ["b"])),
     hops: pickFirst(raw, ["hops"], null),
     chain: normalizeChain(raw.chain),
+    partial: Boolean(raw.partial),
+    stale: Boolean(raw.stale),
+    pathLimits: raw.path_limits || raw.pathLimits || null,
   };
 }
 
@@ -880,6 +902,23 @@ function normalizeLogLines(payload) {
         pickFirst(raw, ["message", "summary", "detail", "description"]) || JSON.stringify(raw),
     };
   });
+}
+
+export function normalizeRelatedThroughPage(payload) {
+  const related = normalizeRelatedThrough(payload);
+  const reportedTotal = Number(payload?.total);
+  const total = Number.isFinite(reportedTotal) && reportedTotal >= related.length ? reportedTotal : related.length;
+  const reportedLimit = Number(payload?.limit);
+  const limit = Number.isFinite(reportedLimit) && reportedLimit > 0 ? reportedLimit : related.length;
+  return {
+    related,
+    total,
+    limit,
+    hasMore: Boolean(payload?.has_more ?? payload?.hasMore) || total > related.length,
+    partial: Boolean(payload?.partial),
+    stale: Boolean(payload?.stale),
+    pathLimits: payload?.path_limits || payload?.pathLimits || null,
+  };
 }
 
 function normalizeStep(item, index) {
@@ -1036,6 +1075,7 @@ export function isTerminalStatus(status) {
   return (
     normalized.includes("done") ||
     normalized.includes("complete") ||
+    normalized.includes("partial") ||
     normalized.includes("success") ||
     normalized.includes("failed") ||
     normalized.includes("error") ||

@@ -1,5 +1,5 @@
 import { FingerprintIcon, GitCompareArrowsIcon, RefreshCwIcon, TableIcon, TriangleAlertIcon, UnplugIcon, XIcon } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 
 import {
@@ -8,6 +8,7 @@ import {
   normalizeExplorerGraph,
   normalizeGraphLinks,
   normalizeRelatedThrough,
+  normalizeRelatedThroughPage,
 } from "@/api.js";
 import LazyClusterGraph from "@/components/LazyClusterGraph.jsx";
 import { EmptyState, ErrorState, LoadingState, PageHeader, Section } from "@/components/page.jsx";
@@ -24,6 +25,35 @@ import { domainUrl } from "@/lib/routes.js";
 
 const EXPANSION_MAX_DOMAINS = 30;
 const RUN_DEBOUNCE_MS = 400;
+
+export function comparisonSelectionKey(selected) {
+  return JSON.stringify(selected);
+}
+
+export function isCurrentComparisonRequest(request, currentRequest, selectionKey) {
+  return Boolean(
+    request &&
+      currentRequest &&
+      request.id === currentRequest.id &&
+      request.key === currentRequest.key &&
+      request.key === selectionKey,
+  );
+}
+
+export function comparisonViewState(state, selected) {
+  const selectionKey = comparisonSelectionKey(selected);
+  const current = state?.key === selectionKey;
+  return {
+    result: current ? state.result : null,
+    relatedChains: current ? state.relatedChains : new Map(),
+    seedDomains: current ? state.seedDomains : [],
+    busy: current && Boolean(state.busy),
+    ready: current && !state.busy && Boolean(state.result),
+    error: current ? state.error : null,
+    partialWarning: current ? state.partialWarning : null,
+    pathCoverage: current ? state.pathCoverage : null,
+  };
+}
 
 // The API may return the same channel with different casing or a trailing dot
 // trimmed. Use this only for comparisons; keep the server's spelling for UI.
@@ -52,7 +82,7 @@ export default function ComparePage() {
   const add = (domain) => !selected.includes(domain) && setSelected([...selected, domain]);
   const remove = (domain) => setSelected(selected.filter((entry) => entry !== domain));
 
-  const { result, relatedChains, seedDomains, busy, error, partialWarning, run } = useComparison(selected);
+  const { result, relatedChains, seedDomains, busy, ready, error, partialWarning, pathCoverage, run } = useComparison(selected);
 
   // The comparison follows the selection: adding or removing a channel
   // re-scores, so there is no stale "press the button again" state to notice.
@@ -88,13 +118,38 @@ export default function ComparePage() {
         .filter((entry) => entry.hops > 1)
         .forEach((entry) => chains.push({ a: seed, b: entry.target, hops: entry.hops, chain: entry.chain }));
     });
-    return { title: "Channel connection report", domains: result?.domains || selected, pairs, chains };
-  }, [result, selected, pairs, relatedChains]);
+    const poolLinks = result?.pool_links || {};
+    const poolMeta = result?.pool_link_meta || {};
+    const exportPairs = [...pairs];
+    const seenPairs = new Set(pairs.map((pair) => pairVerdictKey(pair.a, pair.b)));
+    for (const [domain, links] of Object.entries(poolLinks)) {
+      for (const link of normalizeGraphLinks({ links })) {
+        if (!link?.target) continue;
+        const key = pairVerdictKey(domain, link.target);
+        if (seenPairs.has(key)) continue;
+        seenPairs.add(key);
+        exportPairs.push({ ...link, a: domain, b: link.target, connected: true,
+          verdictSummary: savedVerdicts.get(key) || link.verdictSummary });
+      }
+    }
+    const directShown = exportPairs.filter((pair) => pair.connected).length;
+    const hasMoreDirect = Object.values(poolMeta).some((meta) => meta.has_more);
+    const selectedKeys = new Set(selected.map(domainKey));
+    const selectedShown = (result?.domains || []).filter((domain) => selectedKeys.has(domainKey(domain))).length;
+    return {
+      title: "Channel connection report", domains: result?.domains || selected, pairs: exportPairs, chains,
+      coverage: {
+        direct: { shown: directShown, total: hasMoreDirect ? null : directShown, hasMore: hasMoreDirect },
+        paths: pathCoverage,
+        selection: { shown: selectedShown, total: selected.length, truncated: selectedShown < selected.length || Boolean(result?.selection_truncated) },
+      },
+    };
+  }, [result, selected, pairs, relatedChains, pathCoverage, savedVerdicts]);
 
   return (
     <>
       <PageHeader
-        actions={result ? <ExportMenu scope={exportScope} /> : null}
+        actions={result ? <ExportMenu disabled={!ready} scope={exportScope} /> : null}
         description="Check whether channels share infrastructure or identifiers — with each other and with the rest of the pool."
         title="Compare channels"
       />
@@ -170,10 +225,10 @@ export default function ComparePage() {
           <AlertDescription>{partialWarning}</AlertDescription>
         </Alert>
       ) : null}
-      {busy && !result ? <LoadingState message="Scoring connections…" /> : null}
+      {busy ? <LoadingState message="Scoring connections…" /> : null}
 
-      {result && selected.length > 0 ? (
-        <div className={busy ? "flex flex-col gap-6 opacity-60 transition-opacity" : "flex flex-col gap-6 transition-opacity"}>
+      {result && ready && selected.length > 0 ? (
+        <div className="flex flex-col gap-6 transition-opacity">
           <Verdict expandedCount={expandedCount} pairs={pairs} seedSet={seedSet} />
           <Tabs defaultValue={seedDomains.length >= 2 ? "pairs" : "pool"} key={seedDomains.length >= 2 ? "multi" : "single"}>
             <TabsList variant="line">
@@ -205,7 +260,7 @@ export default function ComparePage() {
             </TabsContent>
             {result.pool_links ? (
               <TabsContent className="pt-4" value="pool">
-                <PoolLinksPanel poolLinks={result.pool_links} seedSet={seedSet} />
+                <PoolLinksPanel onVerdictSaved={handleVerdictSaved} poolLinks={result.pool_links} savedVerdicts={savedVerdicts} seedSet={seedSet} />
               </TabsContent>
             ) : null}
           </Tabs>
@@ -297,7 +352,7 @@ export function PairsPanel({ pairs, seedSet, expandedCount, onVerdictSaved }) {
   );
 }
 
-function PoolLinksPanel({ poolLinks, seedSet }) {
+function PoolLinksPanel({ poolLinks, seedSet, savedVerdicts, onVerdictSaved }) {
   const entries = Object.entries(poolLinks || {});
   if (entries.length === 0) {
     return null;
@@ -305,7 +360,10 @@ function PoolLinksPanel({ poolLinks, seedSet }) {
   return (
     <div className="flex flex-col gap-8">
       {entries.map(([domain, rawLinks]) => {
-        const links = normalizeGraphLinks({ links: rawLinks });
+        const links = normalizeGraphLinks({ links: rawLinks }).map((link) => ({
+          ...link,
+          verdictSummary: savedVerdicts.get(pairVerdictKey(domain, link.target)) || link.verdictSummary,
+        }));
         return (
           <Section
             description={links.length === 0 ? "No attributing connections to the wider pool." : "Its strongest links across the whole pool."}
@@ -322,6 +380,7 @@ function PoolLinksPanel({ poolLinks, seedSet }) {
                   foldInfrastructure={(link) => !seedSet.has(link.target)}
                   leftLabel={domain}
                   links={links.slice(0, 8)}
+                  onVerdictSaved={onVerdictSaved}
                 />
                 {links.length > 8 ? (
                   <Link className="text-muted-foreground text-sm hover:underline" to={domainUrl(domain)}>
@@ -341,39 +400,60 @@ function PoolLinksPanel({ poolLinks, seedSet }) {
 // multi-hop neighbourhood so channels reachable only through an intermediary
 // are part of the picture.
 function useComparison(selected) {
-  const [result, setResult] = useState(null);
-  const [seedDomains, setSeedDomains] = useState([]);
-  // Map<seedDomain, relatedThroughEntries[]> — kept (not just used to pick
-  // expansion targets) so the graph can draw a dashed "inferred" edge for a
-  // pair the scorer found no direct evidence for.
-  const [relatedChains, setRelatedChains] = useState(new Map());
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState(null);
-  const [partialWarning, setPartialWarning] = useState(null);
-  const abortRef = useRef(null);
+  const selectionKey = comparisonSelectionKey(selected);
+  const selectionKeyRef = useRef(selectionKey);
+  const requestRef = useRef({ id: 0, key: null, controller: null });
+  const [state, setState] = useState(() => ({
+    key: selectionKey,
+    result: null,
+    seedDomains: [],
+    relatedChains: new Map(),
+    busy: false,
+    error: null,
+    partialWarning: null,
+    pathCoverage: null,
+  }));
 
-  useEffect(() => () => abortRef.current?.abort(), []);
+  // Abort and invalidate the previous request as soon as the selection changes.
+  // The id bump matters even when the user returns to a previous selection while
+  // an aborted request is still unwinding.
+  useLayoutEffect(() => {
+    selectionKeyRef.current = selectionKey;
+    const previous = requestRef.current;
+    previous.controller?.abort();
+    requestRef.current = { id: previous.id + 1, key: selectionKey, controller: null };
+  }, [selectionKey]);
+
+  useEffect(() => () => requestRef.current.controller?.abort(), []);
 
   const run = useCallback(async () => {
-    if (selected.length < 1) {
+    if (selected.length < 1 || selectionKeyRef.current !== selectionKey) {
       return;
     }
-    abortRef.current?.abort();
+    requestRef.current.controller?.abort();
     const controller = new AbortController();
-    abortRef.current = controller;
+    const request = { id: requestRef.current.id + 1, key: selectionKey, controller };
+    requestRef.current = request;
     const { signal } = controller;
+    const isCurrent = () => isCurrentComparisonRequest(request, requestRef.current, selectionKeyRef.current);
 
-    setBusy(true);
-    setError(null);
+    setState({
+      key: selectionKey,
+      result: null,
+      seedDomains: [],
+      relatedChains: new Map(),
+      busy: true,
+      error: null,
+      partialWarning: null,
+      pathCoverage: null,
+    });
     try {
       const seedSet = new Set(selected);
       const relatedLists = await Promise.all(
         selected.map(async (domain) => {
           try {
-            return {
-              entries: normalizeRelatedThrough(await fetchJson(`/api/graph/related/${encodeURIComponent(domain)}`, { signal })),
-              failed: false,
-            };
+            const page = normalizeRelatedThroughPage(await fetchJson(`/api/graph/related/${encodeURIComponent(domain)}`, { signal }));
+            return { ...page, entries: page.related, failed: false };
           } catch (err) {
             // No precomputed neighbourhood (404) is common and fine; a 500 or
             // timeout is a failure to answer and must be reported, or that
@@ -381,10 +461,13 @@ function useComparison(selected) {
             if (signal.aborted) {
               throw err;
             }
-            return { entries: [], failed: err?.status !== 404 };
+            return { entries: [], total: 0, hasMore: false, partial: false, stale: false, pathLimits: null, failed: err?.status !== 404 };
           }
         }),
       );
+      if (!isCurrent()) {
+        return;
+      }
       const relatedTargets = new Set();
       const chainMap = new Map();
       const failures = [];
@@ -418,6 +501,9 @@ function useComparison(selected) {
         body: JSON.stringify({ domains: expanded, pool_links: true }),
         signal,
       });
+      if (!isCurrent()) {
+        return;
+      }
       const returnedDomains = Array.isArray(finalResult.domains) ? finalResult.domains : [];
       const serverTruncated = returnedDomains.length < expanded.length;
       // Intersect against the canonical names the backend resolved, since the
@@ -444,22 +530,50 @@ function useComparison(selected) {
           `The server returned ${returnedDomains.length} of ${expanded.length} submitted channels; some names could not be resolved or were limited by the server.`,
         );
       }
-      setRelatedChains(chainMap);
-      setPartialWarning(warnings.length > 0 ? warnings.join(" ") : null);
-      setSeedDomains(resolvedSeeds.length > 0 ? resolvedSeeds : selected);
-      setResult(finalResult);
+      const limitedPaths = relatedLists.filter((page) => page.partial);
+      const stalePaths = relatedLists.filter((page) => page.stale);
+      if (limitedPaths.length) warnings.push(`Path search reached its limits for ${limitedPaths.length} selected channel(s); other connections may be missing.`);
+      if (stalePaths.length) warnings.push(`The path index is waiting for a refresh for ${stalePaths.length} selected channel(s).`);
+      const pathCoverage = {
+        shown: relatedLists.reduce((count, page) => count + page.entries.length, 0),
+        total: relatedLists.reduce((count, page) => count + page.total, 0),
+        hasMore: relatedLists.some((page) => page.hasMore),
+        partial: limitedPaths.length > 0,
+        failed: failures.length > 0,
+        stale: stalePaths.length > 0,
+        pathLimits: relatedLists.find((page) => page.partial)?.pathLimits || null,
+      };
+      setState({
+        key: selectionKey,
+        result: finalResult,
+        relatedChains: chainMap,
+        seedDomains: resolvedSeeds.length > 0 ? resolvedSeeds : selected,
+        busy: true,
+        error: null,
+        partialWarning: warnings.length > 0 ? warnings.join(" ") : null,
+        pathCoverage,
+      });
     } catch (err) {
-      if (signal.aborted) {
+      if (signal.aborted || !isCurrent()) {
         return;
       }
-      setError(err.message || "Could not load connections.");
+      setState({
+        key: selectionKey,
+        result: null,
+        seedDomains: [],
+        relatedChains: new Map(),
+        busy: false,
+        error: err.message || "Could not load connections.",
+        partialWarning: null,
+        pathCoverage: null,
+      });
     } finally {
-      if (abortRef.current === controller) {
-        abortRef.current = null;
-        setBusy(false);
+      if (isCurrent()) {
+        requestRef.current = { ...request, controller: null };
+        setState((current) => ({ ...current, busy: false }));
       }
     }
-  }, [selected]);
+  }, [selected, selectionKey]);
 
-  return { result, relatedChains, seedDomains, busy, error, partialWarning, run };
+  return { ...comparisonViewState(state, selected), run };
 }
