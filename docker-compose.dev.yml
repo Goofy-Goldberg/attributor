@@ -1,0 +1,32 @@
+services:
+  # Development overlay: code stays on the host and both servers reload when it
+  # changes. Apply together with docker-compose.yml.
+  ip-intel:
+    command: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+    # The development stack has a self-contained database URL below, so an
+    # operator can start it before creating a provider-key .env file.
+    env_file: !reset []
+    volumes:
+      - ./:/app
+    networks: !reset
+      - default
+
+  frontend:
+    image: node:24-slim
+    working_dir: /app/frontend
+    command: sh -c "npm ci && npm run dev -- --host 0.0.0.0"
+    environment:
+      VITE_API_PROXY_TARGET: http://ip-intel:8000
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app/frontend
+      - frontend_node_modules:/app/frontend/node_modules
+    depends_on:
+      ip-intel:
+        condition: service_started
+    networks:
+      - default
+
+volumes:
+  frontend_node_modules:

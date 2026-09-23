@@ -82,7 +82,22 @@ npm run dev
 ```
 
 The Vite dev server runs on `http://127.0.0.1:5173` and proxies `/api` to the FastAPI backend on `http://127.0.0.1:8000`.
-Use Node `20+` locally for the frontend toolchain.
+Use Node `22.12+` locally for the frontend toolchain; the containers use Node 24 LTS.
+
+### Development containers
+
+To run the same development workflow in containers while keeping source code on
+the host, use the development Compose overlay:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+```
+
+Open `http://127.0.0.1:5173`. The FastAPI source is bind-mounted into the
+backend container and reloads automatically; the Vite service bind-mounts the
+frontend and provides hot reload. PostgreSQL and Redis remain containerized.
+The overlay deliberately removes the optional external VPN network, so it does
+not require the production VPN stack.
 
 ### Production-style Local Run
 
