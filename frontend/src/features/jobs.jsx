@@ -1,16 +1,11 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
-import { fetchJson, isTerminalStatus, normalizeJob, useApi } from "@/api.js";
+import { fetchJson, isTerminalStatus, normalizeJob } from "@/api.js";
 
-// The backend has no "list jobs" endpoint, so the jobs shown in the UI are the
-// ones started from this browser. They are persisted so a scan started before
-// a reload (or on another page) keeps reporting progress instead of vanishing
-// the moment the analyst navigates away — the old inline progress card did.
-const STORAGE_KEY = "ipintel.jobs";
-const MAX_JOBS = 10;
-const POLL_MS = 4000;
-
+const ACTIVE_POLL_MS = 5000;
+const IDLE_POLL_MS = 15000;
+const RECENT_LIMIT = 50;
 const JobsContext = createContext(null);
 
 export async function postIngest({ file, targets, label }) {
@@ -32,62 +27,155 @@ export async function postIngest({ file, targets, label }) {
   });
 }
 
-function loadJobs(userId) {
-  try {
-    const parsed = JSON.parse(window.localStorage.getItem(`${STORAGE_KEY}.${userId}`) || "[]");
-    return Array.isArray(parsed) ? parsed.filter((job) => job && job.id) : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveJobs(jobs, userId) {
-  try {
-    window.localStorage.setItem(`${STORAGE_KEY}.${userId}`, JSON.stringify(jobs));
-  } catch {
-    // Best effort; the in-memory list still works for this session.
-  }
+function newestFirst(a, b) {
+  return (Date.parse(b.createdAt || b.startedAt || "") || 0) - (Date.parse(a.createdAt || a.startedAt || "") || 0);
 }
 
 export function JobsProvider({ children, userId }) {
-  const [jobs, setJobs] = useState(() => loadJobs(userId));
-  // Live snapshots from polling, keyed by job id. Not persisted: only the
-  // terminal status is, so a finished job is never polled again after reload.
-  const [snapshots, setSnapshots] = useState({});
+  const [optimisticJobs, setOptimisticJobs] = useState([]);
+  const [dismissed, setDismissed] = useState(() => new Set());
   const [sheetOpen, setSheetOpen] = useState(false);
-  // Pages that show pool contents (the channel table) refresh when a scan
-  // starts — targets land in the pool immediately — and again when it ends.
+  const [serverLists, setServerLists] = useState({ active: null, recent: null, error: null });
   const poolListeners = useRef(new Set());
+  const knownStatuses = useRef(new Map());
+  const baselineAt = useRef(null);
+  const optimisticRef = useRef([]);
+  const serverSeenIds = useRef(new Set());
+  const refreshRef = useRef(null);
 
-  useEffect(() => saveJobs(jobs, userId), [jobs, userId]);
+  useEffect(() => {
+    let live = true;
+    let inFlight = false;
+    let refreshPending = false;
+    let timer;
+    let controller;
+    let hasServerActive = false;
 
-  const addJob = useCallback((job) => {
-    setJobs((current) => [{ status: "queued", startedAt: new Date().toISOString(), ...job }, ...current.filter((entry) => entry.id !== job.id)].slice(0, MAX_JOBS));
-    poolListeners.current.forEach((listener) => listener(job.id));
+    const schedule = (delay) => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(load, delay);
+    };
+    const load = async () => {
+      if (!live) {
+        return;
+      }
+      if (document.hidden) {
+        schedule(IDLE_POLL_MS);
+        return;
+      }
+      if (inFlight) {
+        refreshPending = true;
+        return;
+      }
+      inFlight = true;
+      controller = new AbortController();
+      try {
+        const [active, recent] = await Promise.all([
+          fetchJson("/api/jobs?status=active&limit=5000", { signal: controller.signal }),
+          fetchJson(`/api/jobs?status=recent&limit=${RECENT_LIMIT}`, { signal: controller.signal }),
+        ]);
+        if (live) {
+          hasServerActive = active.jobs.length > 0;
+          for (const job of [...active.jobs, ...recent.jobs]) {
+            serverSeenIds.current.add(job.id || job.job_id);
+          }
+          setServerLists({ active: active.jobs, recent: recent.jobs, error: null });
+        }
+      } catch (error) {
+        if (live && error.name !== "AbortError") {
+          setServerLists((current) => ({ ...current, error: error.message || "Request failed." }));
+        }
+      } finally {
+        inFlight = false;
+        if (live) {
+          const hasPending = optimisticRef.current.some((job) => !serverSeenIds.current.has(job.id));
+          schedule(refreshPending ? 0 : hasServerActive || hasPending ? ACTIVE_POLL_MS : IDLE_POLL_MS);
+          refreshPending = false;
+        }
+      }
+    };
+
+    const onVisibilityChange = () => {
+      if (!document.hidden) {
+        schedule(0);
+      }
+    };
+    refreshRef.current = () => schedule(0);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    load();
+    return () => {
+      live = false;
+      window.clearTimeout(timer);
+      controller?.abort();
+      refreshRef.current = null;
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
   }, []);
 
-  const clearFinished = useCallback(() => {
-    setJobs((current) => current.filter((job) => !isTerminalStatus(job.status)));
-  }, []);
+  const listReady = Array.isArray(serverLists.active) && Array.isArray(serverLists.recent);
 
-  const handleSnapshot = useCallback((id, snapshot) => {
-    setSnapshots((current) => ({ ...current, [id]: snapshot }));
-    if (!isTerminalStatus(snapshot.status)) {
+  const jobs = useMemo(() => {
+    const byId = new Map(optimisticJobs.filter((job) => !serverSeenIds.current.has(job.id)).map((job) => [job.id, job]));
+    for (const raw of [...(serverLists.recent || []), ...(serverLists.active || [])]) {
+      const job = normalizeJob(raw);
+      if (job.id) {
+        byId.set(job.id, job);
+      }
+    }
+    return [...byId.values()].filter((job) => !dismissed.has(job.id)).sort(newestFirst);
+  }, [serverLists, optimisticJobs, dismissed]);
+
+  useEffect(() => {
+    if (!listReady) {
       return;
     }
-    setJobs((current) => current.map((job) => (job.id === id ? { ...job, status: snapshot.status, finishedAt: new Date().toISOString() } : job)));
-    const failed = snapshot.status.includes("fail") || snapshot.status.includes("error");
-    if (failed) {
-      toast.error("Scan failed", { description: snapshot.summary || `Job ${id} did not finish.` });
-    } else {
-      toast.success("Scan finished", {
-        description: snapshot.failedTargets
-          ? `${snapshot.failedTargets} target(s) failed; the rest joined the pool.`
-          : "New results are in the channel pool.",
-      });
+    if (baselineAt.current === null) {
+      baselineAt.current = Date.now();
+      if (knownStatuses.current.size === 0) {
+        for (const job of jobs) {
+          knownStatuses.current.set(job.id, job.status);
+        }
+        return;
+      }
     }
-    poolListeners.current.forEach((listener) => listener(id));
-  }, []);
+
+    for (const job of jobs) {
+      const previous = knownStatuses.current.get(job.id);
+      const finishedAt = Date.parse(job.finishedAt);
+      const newlyFinished = previous === undefined && Number.isFinite(finishedAt) && finishedAt > baselineAt.current;
+      if (isTerminalStatus(job.status) && ((previous && !isTerminalStatus(previous)) || newlyFinished)) {
+        poolListeners.current.forEach((listener) => listener(job.id));
+        if (job.createdBy === userId) {
+          const failed = job.status.includes("fail") || job.status.includes("error");
+          if (failed) {
+            toast.error("Scan failed", { description: job.summary || `Scan ${job.id} did not finish.` });
+          } else {
+            toast.success("Scan finished", {
+              description: job.failedTargets
+                ? `${job.failedTargets} target(s) failed; the rest joined the pool.`
+                : "New results are in the channel pool.",
+            });
+          }
+        }
+      }
+      knownStatuses.current.set(job.id, job.status);
+    }
+  }, [jobs, listReady, userId]);
+
+  const addJob = useCallback((job) => {
+    const createdAt = new Date().toISOString();
+    knownStatuses.current.set(job.id, "queued");
+    serverSeenIds.current.delete(job.id);
+    const submitted = { status: "queued", createdAt, startedAt: createdAt, createdBy: userId, ...job };
+    optimisticRef.current = [submitted, ...optimisticRef.current.filter((entry) => entry.id !== job.id)].slice(0, 10);
+    setOptimisticJobs(optimisticRef.current);
+    poolListeners.current.forEach((listener) => listener(job.id));
+    refreshRef.current?.();
+  }, [userId]);
+
+  const clearFinished = useCallback(() => {
+    setDismissed((current) => new Set([...current, ...jobs.filter((job) => isTerminalStatus(job.status)).map((job) => job.id)]));
+  }, [jobs]);
 
   const onPoolChanged = useCallback((listener) => {
     poolListeners.current.add(listener);
@@ -95,40 +183,14 @@ export function JobsProvider({ children, userId }) {
   }, []);
 
   const activeCount = jobs.filter((job) => !isTerminalStatus(job.status)).length;
-
+  const snapshots = useMemo(() => Object.fromEntries(jobs.map((job) => [job.id, job])), [jobs]);
+  const jobsError = serverLists.error;
   const value = useMemo(
-    () => ({ jobs, snapshots, addJob, clearFinished, onPoolChanged, activeCount, sheetOpen, setSheetOpen }),
-    [jobs, snapshots, addJob, clearFinished, onPoolChanged, activeCount, sheetOpen],
+    () => ({ jobs, snapshots, jobsError, addJob, clearFinished, onPoolChanged, activeCount, sheetOpen, setSheetOpen, userId }),
+    [jobs, snapshots, jobsError, addJob, clearFinished, onPoolChanged, activeCount, sheetOpen, userId],
   );
 
-  return (
-    <JobsContext.Provider value={value}>
-      {children}
-      {jobs
-        .filter((job) => !isTerminalStatus(job.status))
-        .map((job) => (
-          <JobWatcher id={job.id} key={job.id} onSnapshot={handleSnapshot} />
-        ))}
-    </JobsContext.Provider>
-  );
-}
-
-// Renders nothing; exists so each running job gets its own polling hook.
-function JobWatcher({ id, onSnapshot }) {
-  const request = useApi(`/api/jobs/${encodeURIComponent(id)}`, { pollInterval: POLL_MS });
-  useEffect(() => {
-    if (request.data) {
-      onSnapshot(id, normalizeJob(request.data, id));
-    }
-  }, [request.data, id, onSnapshot]);
-  // A job the server no longer knows (restart, cleanup) would otherwise poll
-  // forever and keep the sidebar spinner turning.
-  useEffect(() => {
-    if (request.status === 404) {
-      onSnapshot(id, { ...normalizeJob(null, id), status: "failed", summary: "The server no longer has this job." });
-    }
-  }, [request.status, id, onSnapshot]);
-  return null;
+  return <JobsContext.Provider value={value}>{children}</JobsContext.Provider>;
 }
 
 export function useJobs() {

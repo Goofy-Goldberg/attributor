@@ -229,7 +229,8 @@ token. Graph recompute and graph email require the `admin` role.
 
 ### Ingestion
 
-- `POST /api/ingest` — add URLs, domains, IPs, or a CSV to the pool. JSON accepts `{"target": "...", "label": "..."}` for one target, or `{"targets": ["https://example.com/page", "example.org"], "label": "..."}` for a manual list; multipart with a CSV `file` is also supported. URL paths and query strings are accepted, but each URL is scanned by hostname. `label` is an optional free-text tag on the ingest; it scopes nothing. Returns a `job_id` to poll. The scanned targets join the one shared correlation graph.
+- `POST /api/ingest` — add URLs, domains, IPs, or a CSV to the pool. JSON accepts `{"target": "...", "label": "..."}` for one target, or `{"targets": ["https://example.com/page", "example.org"], "label": "..."}` for a manual list; multipart with a CSV `file` is also supported. URL paths and query strings are accepted, but each URL is scanned by hostname. An optional `label` is attached to every submitted registrable domain with the job ID, authenticated user ID, and time. Repeating a scan with another label adds it to the channel; IP targets have no registrable domain to label. Returns a `job_id` to poll. The scanned targets join the one shared correlation graph.
+- `GET /api/jobs?status=active|recent&limit=` — shared work queue summaries, newest first. `active` returns queued and running jobs (default limit 5,000); `recent` returns completed and failed jobs (default limit 50, maximum 200). Each job includes its creator subject and signed display claim when available, the optional ingest label, progress totals, and timestamps.
 - `GET /api/jobs/{job_id}` — poll live ingest progress (stage, percent, logs).
 
 #### Ingestion pipeline tuning
@@ -240,7 +241,10 @@ token. Graph recompute and graph email require the `admin` role.
 
 ### The pool
 
-- `GET /api/pool?search=&limit=` — every channel (registrable domain) in the pool, with host count, recency, and cluster membership.
+- `GET /api/pool?search=&limit=&label=` — every channel (registrable domain) in the pool, with host count, recency, cluster membership, and `labels`. Repeat `label=` to match channels carrying any selected label.
+- `GET /api/labels` — known ingest labels and their distinct channel counts.
+- `GET /api/domain/{value}` — channel details, including its ingest `labels` (separate from OpenCTI labels in the intel payload).
+- `POST /api/labels/archive` — admin only; JSON `{"label": "..."}` hides every channel carrying that label from the pool, including channels with other labels. Stored intel and direct channel URLs remain available.
 
 ### Connections (global)
 

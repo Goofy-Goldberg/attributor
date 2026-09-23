@@ -23,7 +23,7 @@ function parseTargets(text) {
 }
 
 export default function IngestSheet() {
-  const { sheetOpen, setSheetOpen, addJob, jobs, snapshots, clearFinished } = useJobs();
+  const { sheetOpen, setSheetOpen, addJob, jobs, snapshots, jobsError, clearFinished, userId } = useJobs();
   const [mode, setMode] = useState("paste");
   const [text, setText] = useState("");
   const [file, setFile] = useState(null);
@@ -35,6 +35,8 @@ export default function IngestSheet() {
   const targets = useMemo(() => parseTargets(text), [text]);
   const canSubmit = !busy && (mode === "paste" ? targets.length > 0 : Boolean(file));
   const hasFinished = jobs.some((job) => isTerminalStatus(job.status));
+  const yourJobs = jobs.filter((job) => job.createdBy === userId);
+  const otherJobs = jobs.filter((job) => job.createdBy !== userId);
 
   const submit = async (event) => {
     event.preventDefault();
@@ -173,6 +175,8 @@ export default function IngestSheet() {
               </Button>
             </form>
 
+            {jobsError ? <p className="text-destructive text-sm" role="alert">Could not refresh scans: {jobsError}</p> : null}
+
             {jobs.length > 0 ? (
               <>
                 <Separator />
@@ -185,9 +189,18 @@ export default function IngestSheet() {
                       </Button>
                     ) : null}
                   </div>
-                  {jobs.map((job) => (
-                    <JobRow job={job} key={job.id} snapshot={snapshots[job.id]} />
-                  ))}
+                  <div className="flex flex-col gap-3">
+                    <h4 className="text-muted-foreground text-xs font-medium">Your scans</h4>
+                    {yourJobs.length > 0
+                      ? yourJobs.map((job) => <JobRow job={job} key={job.id} snapshot={snapshots[job.id]} />)
+                      : <p className="text-muted-foreground text-xs">You haven&apos;t started a scan yet.</p>}
+                  </div>
+                  <div className="flex flex-col gap-3">
+                    <h4 className="text-muted-foreground text-xs font-medium">Other analysts&apos; scans</h4>
+                    {otherJobs.length > 0
+                      ? otherJobs.map((job) => <JobRow job={job} key={job.id} snapshot={snapshots[job.id]} showCreator />)
+                      : <p className="text-muted-foreground text-xs">No scans from other analysts.</p>}
+                  </div>
                 </div>
               </>
             ) : null}
@@ -198,7 +211,7 @@ export default function IngestSheet() {
   );
 }
 
-function JobRow({ job, snapshot }) {
+function JobRow({ job, snapshot, showCreator = false }) {
   const status = snapshot?.status || job.status;
   const terminal = isTerminalStatus(status);
   const failed = status.includes("fail") || status.includes("error");
@@ -209,9 +222,11 @@ function JobRow({ job, snapshot }) {
     <div className="flex flex-col gap-2 rounded-lg border p-3">
       <div className="flex items-start justify-between gap-2">
         <div className="flex min-w-0 flex-col">
-          <span className="truncate text-sm font-medium">{job.title || `Job ${job.id}`}</span>
+          <span className="truncate text-sm font-medium">
+            {job.title || job.label || (job.totalTargets ? `${job.totalTargets} targets` : `Scan ${job.id}`)}
+          </span>
           <span className="text-muted-foreground text-xs">
-            {job.label ? `${job.label} · ` : ""}
+            {showCreator ? `${job.createdByDisplay || "Unknown analyst"} · ` : ""}
             {formatDate(job.startedAt)}
           </span>
         </div>

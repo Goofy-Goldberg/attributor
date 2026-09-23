@@ -54,6 +54,8 @@ function connectionResult(domains) {
 }
 
 async function installRoutes(page) {
+  const session = await (await page.request.get("/api/auth/get-session")).json();
+  let submitted = false;
   await page.route("**/api/**", async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -70,7 +72,14 @@ async function installRoutes(page) {
       return json(POOL);
     }
     if (url.pathname === "/api/ingest" && request.method() === "POST") {
+      submitted = true;
       return json({ job_id: "job-e2e-1", accepted: 2 });
+    }
+    if (url.pathname === "/api/jobs") {
+      return json({ jobs: url.searchParams.get("status") === "active" && submitted ? [{
+        id: "job-e2e-1", status: "running", percent: 20, stage: "Scanning domains",
+        total_targets: 2, created_by: session.user.id, created_at: new Date().toISOString(),
+      }] : [] });
     }
     if (url.pathname === "/api/jobs/job-e2e-1") {
       return json({ id: "job-e2e-1", status: "running", progress: 20, stage: "Scanning domains" });
@@ -168,6 +177,7 @@ test("submitting channels keeps the running job visible", async ({ page }) => {
   await page.getByRole("button", { name: "Scan 2 targets" }).click();
 
   await expect(page.getByRole("heading", { name: "Recent scans" })).toBeVisible();
+  await expect(page.getByText("Your scans", { exact: true })).toBeVisible();
   await expect(page.getByText("2 targets", { exact: true })).toBeVisible();
   await expect(page.getByText("Scanning…", { exact: true })).toBeVisible();
 });

@@ -9,9 +9,12 @@ from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from db.intel_db import registrable_domain
+
 
 DEFAULT_DATABASE_URL = "postgresql://ip_intel:ip_intel@postgres:5432/ip_intel"
 JOB_STAGES = ["intake", "enrichment", "comparison", "clustering", "notification"]
+BUILTIN_INPUT_MODES = frozenset({"csv", "manual_urls", "single", "opencti_website_full"})
 
 
 def database_url() -> str:
@@ -44,6 +47,9 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS jobs (
             id TEXT PRIMARY KEY,
             case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+            label TEXT,
+            created_by TEXT,
+            created_by_display TEXT,
             status TEXT NOT NULL,
             stage TEXT NOT NULL,
             percent INTEGER NOT NULL DEFAULT 0,
@@ -59,6 +65,11 @@ def init_db() -> None:
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
         """,
+        # Existing deployments predate job ownership.  These are deliberately
+        # additive, so boot can update an already-populated database in place.
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS label TEXT",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS created_by TEXT",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS created_by_display TEXT",
         """
         CREATE TABLE IF NOT EXISTS job_logs (
             id BIGSERIAL PRIMARY KEY,
@@ -79,6 +90,29 @@ def init_db() -> None:
             upload_row INTEGER,
             source TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS channel_labels (
+            registrable_domain TEXT NOT NULL,
+            label TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            added_by TEXT,
+            added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (registrable_domain, label, job_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS app_migrations (
+            name TEXT PRIMARY KEY,
+            applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS archived_channels (
+            registrable_domain TEXT PRIMARY KEY,
+            archived_by TEXT NOT NULL,
+            archived_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
         """,
         """
@@ -170,6 +204,7 @@ def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status)",
         "CREATE INDEX IF NOT EXISTS idx_jobs_case_id ON jobs(case_id)",
         "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)",
+        "CREATE INDEX IF NOT EXISTS idx_jobs_status_created_at ON jobs(status, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_job_logs_job_id_id ON job_logs(job_id, id)",
         "CREATE INDEX IF NOT EXISTS idx_search_runs_case_id ON search_runs(case_id)",
         "CREATE INDEX IF NOT EXISTS idx_search_runs_normalized_target ON search_runs(normalized_target)",
@@ -179,15 +214,43 @@ def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_identifiers_value ON search_run_identifiers(category, value)",
         "CREATE INDEX IF NOT EXISTS idx_provider_hits_value ON search_run_provider_hits(provider, value)",
         "CREATE INDEX IF NOT EXISTS idx_discovered_targets_value ON search_run_discovered_targets(discovered_target)",
+        "CREATE INDEX IF NOT EXISTS idx_channel_labels_label_domain ON channel_labels(label, registrable_domain)",
     ]
     with connect() as conn:
         with conn.cursor() as cur:
             for statement in statements:
                 cur.execute(statement)
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (882417311,))
+            cur.execute("SELECT 1 FROM app_migrations WHERE name = 'channel_labels_backfill'")
+            if cur.fetchone() is None:
+                cur.execute("""
+                    SELECT ci.normalized_target, c.input_mode, j.id AS job_id,
+                           c.created_at
+                    FROM cases c
+                    JOIN jobs j ON j.case_id = c.id
+                    JOIN case_inputs ci ON ci.case_id = c.id
+                    WHERE c.input_mode <> ALL(%s)
+                """, (list(BUILTIN_INPUT_MODES),))
+                rows = cur.fetchall()
+                labels = {
+                    (domain, row["input_mode"], row["job_id"], row["created_at"])
+                    for row in rows
+                    if (domain := registrable_domain(row["normalized_target"]))
+                }
+                if labels:
+                    cur.executemany("""
+                        INSERT INTO channel_labels (registrable_domain, label, job_id, added_at)
+                        VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING
+                    """, list(labels))
+                cur.execute("INSERT INTO app_migrations (name) VALUES ('channel_labels_backfill')")
         conn.commit()
 
 
-def create_case(inputs: list[dict[str, Any]], *, input_mode: str) -> dict[str, str]:
+def create_case(
+    inputs: list[dict[str, Any]], *, input_mode: str,
+    label: str | None = None,
+    created_by: str | None = None, created_by_display: str | None = None,
+) -> dict[str, str]:
     case_id = str(uuid.uuid4())
     job_id = str(uuid.uuid4())
     title = ", ".join(item["normalized_target"] for item in inputs[:3]) or "New case"
@@ -220,10 +283,11 @@ def create_case(inputs: list[dict[str, Any]], *, input_mode: str) -> dict[str, s
             cur.execute(
                 """
                 INSERT INTO jobs (
-                    id, case_id, status, stage, percent, total_targets, logs
-                ) VALUES (%s, %s, 'queued', 'intake', 0, %s, %s)
+                    id, case_id, label, created_by, created_by_display,
+                    status, stage, percent, total_targets, logs
+                ) VALUES (%s, %s, %s, %s, %s, 'queued', 'intake', 0, %s, %s)
                 """,
-                (job_id, case_id, len(inputs), Jsonb([])),
+                (job_id, case_id, label, created_by, created_by_display, len(inputs), Jsonb([])),
             )
             for item in inputs:
                 cur.execute(
@@ -241,8 +305,33 @@ def create_case(inputs: list[dict[str, Any]], *, input_mode: str) -> dict[str, s
                         item.get("source", input_mode),
                     ),
                 )
+            if label:
+                for domain in {
+                    registrable_domain(item["normalized_target"])
+                    for item in inputs
+                    if item["target_type"] == "domain"
+                } - {None}:
+                    cur.execute("""
+                        INSERT INTO channel_labels (registrable_domain, label, job_id, added_by)
+                        VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING
+                    """, (domain, label, job_id, created_by))
         conn.commit()
     return {"case_id": case_id, "job_id": job_id}
+
+
+def archive_channels_with_label(label: str, *, archived_by: str) -> int:
+    """Hide channels carrying a label while retaining their intel and labels."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO archived_channels (registrable_domain, archived_by)
+                SELECT DISTINCT registrable_domain, %s FROM channel_labels WHERE label = %s
+                ON CONFLICT (registrable_domain) DO NOTHING
+                RETURNING registrable_domain
+            """, (archived_by, label))
+            count = len(cur.fetchall())
+        conn.commit()
+    return count
 
 
 def list_cases() -> list[dict[str, Any]]:
@@ -334,6 +423,32 @@ def get_job(job_id: str) -> dict[str, Any] | None:
                 (job_id,),
             )
             return cur.fetchone()
+
+
+def list_jobs(*, status: str, limit: int) -> list[dict[str, Any]]:
+    """Return lightweight job cards for the shared analyst work queue."""
+    statuses = {
+        "active": ["queued", "running"],
+        "recent": ["completed", "failed"],
+    }.get(status)
+    if statuses is None:
+        raise ValueError(f"Unsupported job status filter: {status}")
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, status, stage, percent, current_target,
+                       total_targets, completed_targets, failed_targets,
+                       label, created_by, created_by_display,
+                       created_at, started_at, finished_at, updated_at
+                FROM jobs
+                WHERE status = ANY(%s::text[])
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s
+                """,
+                (statuses, limit),
+            )
+            return list(cur.fetchall())
 
 
 def load_case_inputs(case_id: str) -> list[dict[str, Any]]:

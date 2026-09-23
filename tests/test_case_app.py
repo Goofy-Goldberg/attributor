@@ -26,6 +26,7 @@ def _quiet(monkeypatch, *, authenticated: bool = True) -> None:
     # reads, warming and invalidation all go through it, and cases.cache is
     # built to run degraded (computing live) whenever it returns None.
     monkeypatch.setattr(case_app.cache, "_redis_client", lambda: None)
+    monkeypatch.setattr(case_app.intel_db, "verdict_summaries_for_pairs", lambda _pairs: {})
     if authenticated:
         async def _admin(_request):
             return {"sub": "test-admin", "role": "admin"}
@@ -64,18 +65,23 @@ def test_api_requires_login_before_running_protected_work(monkeypatch) -> None:
             response = client.post(path)
             assert response.status_code == 401, path
         assert client.get("/api/pool").status_code == 401
+        assert client.put("/api/verdicts", json={}).status_code == 401
+        assert client.get("/api/verdicts", params={"a": "a.com", "b": "b.com"}).status_code == 401
+        assert client.get("/api/verdicts/export").status_code == 401
+        assert client.get("/api/jobs", params={"status": "active"}).status_code == 401
         assert client.get("/api/health").status_code == 200
 
 
 def test_regular_user_can_ingest_but_cannot_email_or_recompute(monkeypatch) -> None:
     _quiet(monkeypatch, authenticated=False)
     headers = _auth_headers(monkeypatch)
-    monkeypatch.setattr(case_app.runtime, "submit_case", lambda inputs, input_mode: {"case_id": "i", "job_id": "j"})
+    monkeypatch.setattr(case_app.runtime, "submit_case", lambda inputs, **_kwargs: {"case_id": "i", "job_id": "j"})
     monkeypatch.setattr(case_app, "get_job", lambda job_id: None)
     with TestClient(case_app.app) as client:
         assert client.post("/api/ingest", json={"target": "example.com"}, headers=headers).status_code == 202
         assert client.post("/api/graph/recompute", headers=headers).status_code == 403
         assert client.post("/api/graph/email", headers=headers).status_code == 403
+        assert client.post("/api/labels/archive", json={"label": "Batch A"}, headers=headers).status_code == 403
 
 
 def test_admin_token_allows_recompute_and_email(monkeypatch) -> None:
@@ -151,8 +157,8 @@ def test_ingest_adds_to_pool(monkeypatch) -> None:
     _quiet(monkeypatch)
     captured: dict = {}
 
-    def _submit(inputs, input_mode):
-        captured["input_mode"] = input_mode
+    def _submit(inputs, **kwargs):
+        captured.update(kwargs)
         captured["count"] = len(inputs)
         return {"case_id": "ingest-1", "job_id": "job-9"}
 
@@ -167,8 +173,103 @@ def test_ingest_adds_to_pool(monkeypatch) -> None:
     assert body["job_id"] == "job-9"
     assert body["label"] == "campaign-x"
     assert body["accepted"] == 1
-    # The label becomes the ingest tag (input_mode); it scopes nothing.
-    assert captured["input_mode"] == "campaign-x"
+    assert captured["input_mode"] == "single"
+    assert captured["label"] == "campaign-x"
+    assert captured["created_by"] == "test-admin"
+
+
+def test_labels_endpoint_and_repeated_pool_filter(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    captured = {}
+
+    def _pool(**kwargs):
+        captured.update(kwargs)
+        return {"total": 1, "offset": 0, "limit": 50, "domains": [{"domain": "example.com", "labels": ["Batch A", "Batch B"]}]}
+
+    monkeypatch.setattr(case_app.intel_db, "list_pool_domains", _pool)
+    monkeypatch.setattr(case_app.intel_db, "list_channel_labels", lambda: [{"label": "Batch A", "channel_count": 2}])
+    with TestClient(case_app.app) as client:
+        pool = client.get("/api/pool?label=Batch+A&label=Batch+B")
+        labels = client.get("/api/labels")
+
+    assert pool.status_code == 200
+    assert captured["labels"] == ["Batch A", "Batch B"]
+    assert pool.json()["domains"][0]["labels"] == ["Batch A", "Batch B"]
+    assert labels.json() == {"labels": [{"label": "Batch A", "channel_count": 2}]}
+
+
+def test_admin_archives_label_with_verified_identity(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    captured = {}
+
+    def _archive(label, *, archived_by):
+        captured.update(label=label, archived_by=archived_by)
+        return 2
+
+    monkeypatch.setattr(case_app, "archive_channels_with_label", _archive)
+    with TestClient(case_app.app) as client:
+        response = client.post("/api/labels/archive", json={"label": " Batch A "})
+
+    assert response.json() == {"label": "Batch A", "archived": 2}
+    assert captured == {"label": "Batch A", "archived_by": "test-admin"}
+
+
+def test_ingest_records_verified_creator_and_display_claim(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    captured: dict = {}
+
+    async def _identity(_request):
+        return {"sub": "user-42", "role": "user", "email": "analyst@stratc.org"}
+
+    monkeypatch.setattr(case_app, "authenticate_request", _identity)
+    monkeypatch.setattr(
+        case_app.runtime,
+        "submit_case",
+        lambda _inputs, **kwargs: captured.update(kwargs) or {"case_id": "ingest-2", "job_id": "job-10"},
+    )
+    monkeypatch.setattr(case_app, "get_job", lambda _job_id: None)
+
+    with TestClient(case_app.app) as client:
+        response = client.post("/api/ingest", json={"target": "example.com"})
+
+    assert response.status_code == 202
+    assert captured["created_by"] == "user-42"
+    assert captured["created_by_display"] == "analyst@stratc.org"
+
+
+def test_jobs_endpoint_lists_active_and_recent_cards(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    calls: list[tuple[str, int]] = []
+
+    def _list_jobs(*, status, limit):
+        calls.append((status, limit))
+        return [{
+            "id": f"{status}-job", "status": "running" if status == "active" else "completed",
+            "stage": "enrichment", "percent": 45, "current_target": "example.com",
+            "total_targets": 4, "completed_targets": 1, "failed_targets": 0,
+            "label": "campaign-x", "created_by": "user-42",
+            "created_by_display": "analyst@stratc.org", "created_at": "2026-09-23T09:00:00Z",
+            "started_at": "2026-09-23T09:01:00Z", "finished_at": None,
+            "updated_at": "2026-09-23T09:02:00Z",
+        }]
+
+    monkeypatch.setattr(case_app, "list_jobs", _list_jobs)
+    with TestClient(case_app.app) as client:
+        active = client.get("/api/jobs", params={"status": "active"})
+        recent = client.get("/api/jobs", params={"status": "recent", "limit": 12})
+
+    assert active.status_code == 200
+    assert recent.status_code == 200
+    assert calls == [("active", 5_000), ("recent", 12)]
+    assert active.json()["jobs"][0]["created_by_display"] == "analyst@stratc.org"
+    assert recent.json()["jobs"][0]["label"] == "campaign-x"
+
+
+def test_jobs_endpoint_rejects_unknown_status_and_invalid_limit(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    with TestClient(case_app.app) as client:
+        assert client.get("/api/jobs", params={"status": "all"}).status_code == 422
+        assert client.get("/api/jobs", params={"status": "recent", "limit": 201}).status_code == 422
 
 
 def test_pool_endpoint(monkeypatch) -> None:

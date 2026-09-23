@@ -45,6 +45,31 @@ describe("API payload normalizers", () => {
     expect(normalizeJob(null, "fallback")).toMatchObject({ id: "fallback", status: "unknown", percent: null });
   });
 
+  it("keeps scan ownership and totals from list summaries", () => {
+    expect(normalizeJob({
+      id: "scan-8",
+      status: "running",
+      percent: 40,
+      total_targets: 5,
+      completed_targets: 2,
+      failed_targets: 1,
+      label: "Election sites",
+      created_by: "analyst-1",
+      created_by_display: "Alex",
+      created_at: "2026-09-23T10:00:00Z",
+      started_at: "2026-09-23T10:01:00Z",
+    })).toMatchObject({
+      id: "scan-8",
+      totalTargets: 5,
+      completedTargets: 2,
+      failedTargets: 1,
+      label: "Election sites",
+      createdBy: "analyst-1",
+      createdByDisplay: "Alex",
+      startedAt: "2026-09-23T10:01:00Z",
+    });
+  });
+
   it("normalizes direct graph links and preserves evidence context", () => {
     const [link] = normalizeGraphLinks({
       links: [
@@ -119,8 +144,8 @@ describe("API payload normalizers", () => {
   });
 
   it("normalizes pools, clusters, selectors, and search results from API field variants", () => {
-    expect(normalizePool({ domains: [{ domain: { name: "alpha.example" }, hostCount: 3, ingested: true }, {}] })).toEqual([
-      expect.objectContaining({ domain: "alpha.example", hostCount: 3, connectionCount: 0, ingested: true }),
+    expect(normalizePool({ domains: [{ domain: { name: "alpha.example" }, hostCount: 3, ingested: true, labels: ["Batch A"] }, {}] })).toEqual([
+      expect.objectContaining({ domain: "alpha.example", hostCount: 3, connectionCount: 0, ingested: true, labels: ["Batch A"] }),
     ]);
     expect(
       normalizeGraphClusters({

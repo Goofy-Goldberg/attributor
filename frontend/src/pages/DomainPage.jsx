@@ -101,6 +101,7 @@ export default function DomainPage() {
             <h1 className="font-heading text-2xl font-semibold tracking-tight break-all">{value}</h1>
             {profile ? <ProvenanceBadge ingested={profile.ingested} /> : null}
             {profile?.tier ? <TierBadge tier={profile.tier} /> : null}
+            {(profile?.labels || []).map((label) => <Badge key={label} variant="secondary">{label}</Badge>)}
           </div>
           {profile && !profile.ingested && intel?.discovery_kind ? (
             <p className="text-muted-foreground text-sm">

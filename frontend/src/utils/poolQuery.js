@@ -1,5 +1,6 @@
 export const DEFAULT_POOL_FILTERS = {
   search: "",
+  labels: [],
   provenance: "all",
   sort: "recent",
   minConnections: "",
@@ -16,6 +17,7 @@ export const DEFAULT_PAGE_SIZE = 50;
 // of the pool can be linked, and Back returns to the same filtered page.
 const URL_KEYS = {
   search: "q",
+  labels: "label",
   provenance: "provenance",
   sort: "sort",
   minConnections: "min",
@@ -28,7 +30,9 @@ const URL_KEYS = {
 
 export function filtersFromParams(params) {
   return Object.fromEntries(
-    Object.entries(DEFAULT_POOL_FILTERS).map(([key, fallback]) => [key, params.get(URL_KEYS[key]) ?? fallback]),
+    Object.entries(DEFAULT_POOL_FILTERS).map(([key, fallback]) => [
+      key, key === "labels" ? [...new Set(params.getAll("label").filter(Boolean))] : params.get(URL_KEYS[key]) ?? fallback,
+    ]),
   );
 }
 
@@ -41,6 +45,11 @@ export function writeFilterParams(params, filters, page = 1) {
   const next = new URLSearchParams(params);
   Object.entries(DEFAULT_POOL_FILTERS).forEach(([key, fallback]) => {
     const value = filters[key];
+    if (key === "labels") {
+      next.delete("label");
+      [...new Set(value || [])].forEach((label) => next.append("label", label));
+      return;
+    }
     if (value === undefined || value === null || value === "" || value === fallback) {
       next.delete(URL_KEYS[key]);
     } else {
@@ -60,6 +69,7 @@ export function buildPoolQuery(filters = DEFAULT_POOL_FILTERS, page = 1, pageSiz
   const offset = Math.max(0, (Number(page) || 1) - 1) * pageSize;
 
   appendParam(params, "search", filters.search);
+  (filters.labels || []).forEach((label) => params.append("label", label));
   appendParam(params, "provenance", filters.provenance !== "all" ? filters.provenance : "");
   appendParam(params, "sort", filters.sort !== "recent" ? filters.sort : "");
   appendParam(params, "min_connections", filters.minConnections);
@@ -91,7 +101,9 @@ export function advancedFilterCount(filters = DEFAULT_POOL_FILTERS) {
 }
 
 export function poolFiltersActive(filters = DEFAULT_POOL_FILTERS) {
-  return Object.entries(DEFAULT_POOL_FILTERS).some(([key, value]) => key !== "sort" && filters[key] !== value);
+  return Object.entries(DEFAULT_POOL_FILTERS).some(([key, value]) =>
+    key !== "sort" && (key === "labels" ? (filters.labels || []).length > 0 : filters[key] !== value),
+  );
 }
 
 export function getPoolPageMeta(payload, fallbackCount, page = 1, pageSize = DEFAULT_PAGE_SIZE) {

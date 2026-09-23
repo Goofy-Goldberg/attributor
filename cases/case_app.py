@@ -28,7 +28,7 @@ from fastapi.staticfiles import StaticFiles
 from cases.case_runtime import CaseRuntime, build_job_response, parse_submission
 from cases import auth as api_auth
 from core.analysis_service import normalize_inputs
-from cases.case_store import get_job, healthcheck, init_db, mark_interrupted_jobs
+from cases.case_store import archive_channels_with_label, get_job, healthcheck, init_db, list_jobs, mark_interrupted_jobs
 from cases import cache
 from utils.evidence_meta import evidence_catalog
 from utils import check
@@ -291,11 +291,20 @@ def _ingest_response(identifiers: dict[str, str], *, label: str | None, count: i
     )
 
 
+def _identity_display(identity: dict[str, Any]) -> str | None:
+    """Use a signed human-readable claim when the issuer provided one."""
+    for claim in ("name", "preferred_username", "email"):
+        value = identity.get(claim)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 @app.post("/api/ingest")
 async def api_ingest(request: Request) -> JSONResponse:
     """Add URLs, domains, IPs, or a CSV to the global pool. URL paths are
     reduced to their host before analysis. Results join the shared correlation
-    graph. An optional `label` is just a free-text tag on the ingest. Poll the
+    graph. An optional `label` tags each submitted channel. Poll the
     returned job for progress; connections surface via the /api/graph/* endpoints.
     """
     content_type = (request.headers.get("content-type") or "").lower()
@@ -326,7 +335,16 @@ async def api_ingest(request: Request) -> JSONResponse:
     if not inputs:
         raise HTTPException(status_code=400, detail="Submit a URL, domain, IP, or CSV with at least one valid target.")
 
-    identifiers = runtime.submit_case(inputs, input_mode=label or input_mode)
+    identity = request.state.identity
+    identifiers = runtime.submit_case(
+        inputs,
+        input_mode=input_mode,
+        label=label,
+        created_by=identity["sub"],
+        created_by_display=_identity_display(identity),
+    )
+    if label:
+        cache.invalidate()
     return _ingest_response(identifiers, label=label, count=len(inputs))
 
 
@@ -365,8 +383,28 @@ def api_pool(
         ingested_before=ingested_before,
         discovered_after=discovered_after,
         discovered_before=discovered_before,
+        labels=request.query_params.getlist("label"),
     )
     return _etag_json_response(request, page)
+
+
+@app.get("/api/labels")
+def api_labels() -> dict[str, Any]:
+    """Known ingest labels and the number of channels carrying each one."""
+    return {"labels": intel_db.list_channel_labels()}
+
+
+@app.post("/api/labels/archive")
+async def api_archive_label(request: Request) -> dict[str, Any]:
+    if request.state.identity.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access is required.")
+    payload = await request.json()
+    label = str(payload.get("label") or "").strip() if isinstance(payload, dict) else ""
+    if not label:
+        raise HTTPException(status_code=400, detail="Choose a label to archive.")
+    count = archive_channels_with_label(label, archived_by=request.state.identity["sub"])
+    cache.invalidate()
+    return {"label": label, "archived": count}
 
 
 @app.get("/api/domain/{value:path}")
@@ -675,6 +713,19 @@ async def api_graph_recompute() -> dict[str, Any]:
     stored intel (no rescanning). Run after changing extraction/weight logic."""
     counts = await asyncio.to_thread(intel_db.rebuild_all_correlation)
     return {"status": "recomputed", **counts}
+
+
+@app.get("/api/jobs")
+def api_list_jobs(status: str, limit: int | None = None) -> dict[str, Any]:
+    """List active work or recently finished scans across the shared pool."""
+    if status not in {"active", "recent"}:
+        raise HTTPException(status_code=422, detail="status must be 'active' or 'recent'.")
+    default_limit = 5_000 if status == "active" else 50
+    max_limit = 10_000 if status == "active" else 200
+    requested_limit = default_limit if limit is None else limit
+    if not 1 <= requested_limit <= max_limit:
+        raise HTTPException(status_code=422, detail=f"limit must be between 1 and {max_limit} for {status} jobs.")
+    return {"jobs": list_jobs(status=status, limit=requested_limit)}
 
 
 @app.get("/api/jobs/{job_id}")

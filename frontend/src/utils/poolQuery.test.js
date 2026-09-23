@@ -44,6 +44,18 @@ describe("pool query helpers", () => {
     expect(buildPoolQuery()).toBe("/api/pool?limit=50&offset=0");
   });
 
+  it("keeps multiple labels in the URL and API query", () => {
+    const params = writeFilterParams(new URLSearchParams("page=4"), {
+      ...DEFAULT_POOL_FILTERS,
+      labels: ["UI redesign test", "Follow-up"],
+    });
+    expect(params.toString()).toBe("label=UI+redesign+test&label=Follow-up");
+    const filters = filtersFromParams(params);
+    expect(filters.labels).toEqual(["UI redesign test", "Follow-up"]);
+    expect(poolFiltersActive(filters)).toBe(true);
+    expect(buildPoolQuery(filters)).toBe("/api/pool?label=UI+redesign+test&label=Follow-up&limit=50&offset=0");
+  });
+
   it("summarizes active filters and backend pagination metadata", () => {
     const filters = { ...DEFAULT_POOL_FILTERS, provenance: "discovered", minConnections: "3" };
     expect(advancedFilterCount(filters)).toBe(1);

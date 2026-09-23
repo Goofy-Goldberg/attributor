@@ -81,8 +81,18 @@ class CaseRuntime:
                 return
             self._futures[job_id] = self._executor.submit(self._run_case, case_id, job_id)
 
-    def submit_case(self, inputs: list[dict[str, Any]], *, input_mode: str) -> dict[str, str]:
-        identifiers = create_case(inputs, input_mode=input_mode)
+    def submit_case(
+        self, inputs: list[dict[str, Any]], *, input_mode: str,
+        label: str | None = None,
+        created_by: str | None = None, created_by_display: str | None = None,
+    ) -> dict[str, str]:
+        identifiers = create_case(
+            inputs,
+            input_mode=input_mode,
+            label=label,
+            created_by=created_by,
+            created_by_display=created_by_display,
+        )
         self.submit_existing(identifiers["case_id"], identifiers["job_id"])
         return identifiers
 

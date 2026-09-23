@@ -404,6 +404,14 @@ export function normalizeJob(payload, fallbackId = null) {
       pickFirst(raw, ["completed_steps", "completedSteps", "counts.completed"], null) ?? null,
     totalSteps: pickFirst(raw, ["total_steps", "totalSteps", "counts.total"], null) ?? null,
     failedTargets: pickFirst(raw, ["failed_targets", "failedTargets", "counts.failed"], null) ?? null,
+    totalTargets: pickFirst(raw, ["total_targets", "totalTargets"], null),
+    completedTargets: pickFirst(raw, ["completed_targets", "completedTargets"], null),
+    label: pickFirst(raw, ["label"], null),
+    createdBy: pickFirst(raw, ["created_by", "createdBy"], null),
+    createdByDisplay: pickFirst(raw, ["created_by_display", "createdByDisplay"], null),
+    createdAt: pickFirst(raw, ["created_at", "createdAt"], null),
+    startedAt: pickFirst(raw, ["started_at", "startedAt", "created_at", "createdAt"], null),
+    finishedAt: pickFirst(raw, ["finished_at", "finishedAt"], null),
     updatedAt: pickFirst(raw, ["updated_at", "updatedAt", "last_seen_at", "lastSeenAt"]),
     logs: normalizeLogLines(pickFirst(raw, ["logs", "events", "messages"], [])),
     steps,
@@ -591,6 +599,7 @@ export function normalizePool(payload) {
       const raw = item || {};
       return {
         domain: readableValue(pickFirst(raw, ["domain"])),
+        labels: coerceArray(raw.labels).map((label) => readableValue(label)).filter(Boolean),
         hostCount: pickFirst(raw, ["host_count", "hostCount"], null),
         lastSeen: pickFirst(raw, ["last_seen", "lastSeen"], null),
         // Direct pairwise connections — distinct other domains this one shares

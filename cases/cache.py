@@ -352,6 +352,7 @@ def pool_page(
     ingested_before: str | None = None,
     discovered_after: str | None = None,
     discovered_before: str | None = None,
+    labels: list[str] | None = None,
 ) -> dict[str, Any]:
     params = {
         "search": search,
@@ -365,6 +366,7 @@ def pool_page(
         "ingested_before": ingested_before,
         "discovered_after": discovered_after,
         "discovered_before": discovered_before,
+        "labels": labels or [],
     }
     return cached(
         "pool",

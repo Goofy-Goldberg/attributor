@@ -366,6 +366,23 @@ CREATE TABLE IF NOT EXISTS domain_tiers (
 );
 CREATE INDEX IF NOT EXISTS idx_domain_tiers_tier ON domain_tiers(tier);
 
+-- Analyst labels are durable channel metadata. A row records each job that
+-- applied a label, so repeated ingests retain their provenance.
+CREATE TABLE IF NOT EXISTS channel_labels (
+    registrable_domain TEXT NOT NULL,
+    label TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    added_by TEXT,
+    added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (registrable_domain, label, job_id)
+);
+CREATE INDEX IF NOT EXISTS idx_channel_labels_label_domain ON channel_labels(label, registrable_domain);
+CREATE TABLE IF NOT EXISTS archived_channels (
+    registrable_domain TEXT PRIMARY KEY,
+    archived_by TEXT NOT NULL,
+    archived_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- ── Correlation layer (derived, rebuildable by global recompute) ─────────────
 -- These tables are NOT part of the append-only raw substrate. They are a
 -- normalized projection of the raw `searches`/child tables built so that
@@ -940,7 +957,7 @@ _IDENTIFIER_HANDLE_TYPES = {
 # resets (tests) drop them too; ordered so dependents precede their referents.
 _CORRELATION_TABLES = ["graph_state", "graph_links", "graph_connection_counts", "graph_selector_groups", "graph_cluster_links", "graph_clusters", "entity_edges", "observations", "selectors", "entities"]
 
-_ALL_TABLES = ["searches", *_CHILD_TABLES, "identifiers", "search_fields", "pair_verdicts", *_CORRELATION_TABLES]
+_ALL_TABLES = ["searches", *_CHILD_TABLES, "identifiers", "search_fields", "pair_verdicts", "channel_labels", "archived_channels", *_CORRELATION_TABLES]
 
 _SCHEMA_LOCK = threading.Lock()
 _SCHEMA_READY = False
@@ -6755,6 +6772,7 @@ def list_pool_domains(
     ingested_before: str | None = None,
     discovered_after: str | None = None,
     discovered_before: str | None = None,
+    labels: list[str] | None = None,
     include_total: bool = False,
 ) -> list[dict[str, Any]] | dict[str, Any]:
     """Every registrable domain in the pool with host count, recency, cluster,
@@ -6788,6 +6806,7 @@ def list_pool_domains(
     safe_offset = max(0, int(offset or 0))
     provenance_key = provenance if provenance in {"ingested", "discovered"} else "all"
     sort_key = sort if sort in {"recent", "connections", "domain"} else "recent"
+    selected_labels = list(dict.fromkeys(label.strip() for label in (labels or []) if label.strip()))
     order_by = {
         "connections": "connection_count DESC NULLS LAST, last_seen DESC NULLS LAST, domain",
         "domain": "domain ASC",
@@ -6832,7 +6851,13 @@ def list_pool_domains(
             LEFT JOIN search_fields sf ON sf.search_id = s.id AND sf.key = 'is_seed'
             LEFT JOIN domain_tiers dt ON dt.registrable_domain = e.registrable_domain
             WHERE e.registrable_domain IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM archived_channels ac WHERE ac.registrable_domain = e.registrable_domain)
               AND (%s::text IS NULL OR e.registrable_domain LIKE %s::text)
+              AND (%s::boolean OR EXISTS (
+                  SELECT 1 FROM channel_labels cl
+                  WHERE cl.registrable_domain = e.registrable_domain
+                    AND cl.label = ANY(%s::text[])
+              ))
             GROUP BY e.registrable_domain, gc.cluster_id, gc.component_size, gcc.connection_count, dt.tier
             HAVING (%s::int IS NULL OR COALESCE(gcc.connection_count, 0) >= %s::int)
                AND (%s::int IS NULL OR COALESCE(gcc.connection_count, 0) <= %s::int)
@@ -6849,6 +6874,7 @@ def list_pool_domains(
     """
     params = (
         like, like,
+        not selected_labels, selected_labels,
         min_connections, min_connections,
         max_connections, max_connections,
         discovered_after, discovered_after,
@@ -6864,11 +6890,33 @@ def list_pool_domains(
             f"{base_sql} ORDER BY {order_by} LIMIT %s OFFSET %s",
             (*params, safe_limit, safe_offset),
         ).fetchall()
+        domains = [dict(row) for row in rows]
+        if domains:
+            label_rows = c.execute("""
+                SELECT registrable_domain, array_agg(DISTINCT label ORDER BY label) AS labels
+                FROM channel_labels WHERE registrable_domain = ANY(%s)
+                GROUP BY registrable_domain
+            """, ([row["domain"] for row in domains],)).fetchall()
+            by_domain = {row["registrable_domain"]: row["labels"] for row in label_rows}
+            for domain in domains:
+                domain["labels"] = by_domain.get(domain["domain"], [])
 
-    domains = [dict(row) for row in rows]
     if include_total:
         return {"total": int(total), "domains": domains, "offset": safe_offset, "limit": safe_limit}
     return domains
+
+
+def list_channel_labels() -> list[dict[str, Any]]:
+    init_db()
+    with _conn() as c:
+        rows = c.execute("""
+            SELECT cl.label, count(DISTINCT cl.registrable_domain) AS channel_count
+            FROM channel_labels cl
+            LEFT JOIN archived_channels ac ON ac.registrable_domain = cl.registrable_domain
+            WHERE ac.registrable_domain IS NULL
+            GROUP BY cl.label ORDER BY cl.label
+        """).fetchall()
+    return [dict(row) for row in rows]
 
 
 def _curate_intel(result: dict[str, Any]) -> dict[str, Any]:
@@ -7035,6 +7083,13 @@ def domain_profile(value: str) -> dict[str, Any] | None:
                 ORDER BY s.attributing DESC, s.kind, s.entity_count""",
             host_filter[1],
         ).fetchall()]
+        label_rows = c.execute(
+            "SELECT DISTINCT label FROM channel_labels WHERE registrable_domain = %s ORDER BY label",
+            (key,),
+        ).fetchall() if mode == "rd" else []
+        archived = c.execute(
+            "SELECT 1 FROM archived_channels WHERE registrable_domain = %s", (key,),
+        ).fetchone() is not None if mode == "rd" else False
 
     intel = None
     sid = get_latest_search_id_for_target(key)
@@ -7057,6 +7112,8 @@ def domain_profile(value: str) -> dict[str, Any] | None:
         "ingested": any(host.get("ingested") for host in hosts),
         "ips": ips,
         "selectors": selectors,
+        "labels": [row["label"] for row in label_rows],
+        "archived": archived,
         "intel": intel,
         "tier": get_domain_tier(key) if mode == "rd" else None,
     }

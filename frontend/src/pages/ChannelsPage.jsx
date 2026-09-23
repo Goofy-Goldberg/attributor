@@ -1,6 +1,8 @@
 import {
   ArrowDownIcon,
   ArrowRightIcon,
+  CheckIcon,
+  ChevronsUpDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
   GitCompareArrowsIcon,
@@ -12,12 +14,18 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router";
+import { toast } from "sonner";
 
-import { formatDate, formatLabel, formatNumber, normalizePool, useApi } from "@/api.js";
+import { fetchJson, formatDate, formatLabel, formatNumber, normalizePool, useApi } from "@/api.js";
 import { EmptyState, ErrorState, PageHeader, SkeletonRows } from "@/components/page.jsx";
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
+  AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
 import { Field, FieldGroup, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from "@/components/ui/input-group";
@@ -29,6 +37,7 @@ import { ProvenanceBadge, TierBadge } from "@/features/evidence.jsx";
 import { useJobs } from "@/features/jobs.jsx";
 import { useDebouncedValue } from "@/hooks/use-debounced-value.js";
 import { compareUrl, domainUrl } from "@/lib/routes.js";
+import { authClient } from "@/lib/auth-client.js";
 import { cn } from "@/lib/utils";
 import {
   DEFAULT_PAGE_SIZE,
@@ -49,6 +58,10 @@ const FILTER_DEBOUNCE_MS = 250;
 export default function ChannelsPage() {
   const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
+  const session = authClient.useSession();
+  const isAdmin = session.data?.user?.role === "admin";
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const [archiving, setArchiving] = useState(false);
   const { setSheetOpen, onPoolChanged } = useJobs();
   const filters = useMemo(() => filtersFromParams(params), [params]);
   const page = pageFromParams(params);
@@ -65,13 +78,20 @@ export default function ChannelsPage() {
   // The one place a path change means "same resource, narrowed differently",
   // so the previous rows stay on screen while the next page loads.
   const poolRequest = useApi(poolPath, { keepPreviousData: true });
+  const labelsRequest = useApi("/api/labels");
   const refreshPool = poolRequest.refresh;
+  const refreshLabels = labelsRequest.refresh;
   const domains = useMemo(() => normalizePool(poolRequest.data), [poolRequest.data]);
   const meta = getPoolPageMeta(poolRequest.data, domains.length, page, DEFAULT_PAGE_SIZE);
   const filtersActive = poolFiltersActive(filters);
   const advancedCount = advancedFilterCount(filters);
+  const archiveLabel = filters.labels.length === 1 ? filters.labels[0] : null;
+  const archiveCount = labelsRequest.data?.labels?.find((item) => item.label === archiveLabel)?.channel_count || 0;
 
-  useEffect(() => onPoolChanged(() => refreshPool()), [onPoolChanged, refreshPool]);
+  useEffect(() => onPoolChanged(() => {
+    refreshPool();
+    refreshLabels();
+  }), [onPoolChanged, refreshPool, refreshLabels]);
 
   const update = useCallback(
     (patch, nextPage = 1) => {
@@ -82,6 +102,25 @@ export default function ChannelsPage() {
     [setParams],
   );
   const setPage = (next) => update({}, next);
+
+  const archiveSelectedLabel = async () => {
+    if (!archiveLabel) return;
+    setArchiving(true);
+    try {
+      const result = await fetchJson("/api/labels/archive", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label: archiveLabel }),
+      });
+      toast.success(`${result.archived} channel${result.archived === 1 ? "" : "s"} archived`);
+      update({ labels: [] });
+      labelsRequest.refresh();
+    } catch (error) {
+      toast.error("Could not archive channels", { description: error.message });
+    } finally {
+      setArchiving(false);
+    }
+  };
 
   // Filters debounce but paging is immediate, so a page number can briefly
   // overrun the new result's page count. Snap back instead of showing an
@@ -179,6 +218,17 @@ export default function ChannelsPage() {
               <ToggleGroupItem value="ingested">Ingested</ToggleGroupItem>
               <ToggleGroupItem value="discovered">Discovered</ToggleGroupItem>
             </ToggleGroup>
+
+            <LabelFilter
+              labels={labelsRequest.data?.labels || []}
+              selected={filters.labels}
+              update={update}
+            />
+            {isAdmin && archiveLabel && archiveCount > 0 ? (
+              <Button disabled={archiving} onClick={() => setArchiveOpen(true)} variant="outline">
+                Archive channels…
+              </Button>
+            ) : null}
 
             <AdvancedFilters count={advancedCount} filters={filters} update={update} />
 
@@ -306,6 +356,23 @@ export default function ChannelsPage() {
           </Button>
         </div>
       ) : null}
+
+      {isAdmin ? (
+        <AlertDialog onOpenChange={setArchiveOpen} open={archiveOpen}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Archive channels with “{archiveLabel}”?</AlertDialogTitle>
+              <AlertDialogDescription>
+                This hides {archiveCount} channel{archiveCount === 1 ? "" : "s"} from the pool, including channels with other labels. Their scans and evidence stay stored.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Cancel</AlertDialogCancel>
+              <AlertDialogAction onClick={archiveSelectedLabel}>Archive channels</AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      ) : null}
     </>
   );
 }
@@ -354,6 +421,11 @@ function ChannelRow({ entry, selected, onToggle, onOpen }) {
             {entry.tier ? <TierBadge tier={entry.tier} /> : null}
             <ProvenanceBadge ingested={entry.ingested} />
           </div>
+          {entry.labels.length > 0 ? (
+            <div className="flex flex-wrap gap-1">
+              {entry.labels.map((label) => <Badge key={label} variant="secondary">{label}</Badge>)}
+            </div>
+          ) : null}
           {!entry.ingested && entry.discoveryKind ? (
             <span className="text-muted-foreground truncate text-xs">
               via {formatLabel(entry.discoveryKind)}
@@ -388,6 +460,42 @@ function ChannelRow({ entry, selected, onToggle, onOpen }) {
         <ArrowRightIcon className="text-muted-foreground size-4" />
       </TableCell>
     </TableRow>
+  );
+}
+
+function LabelFilter({ labels, selected, update }) {
+  const [open, setOpen] = useState(false);
+  const selectedLabels = new Set(selected);
+  return (
+    <Popover onOpenChange={setOpen} open={open}>
+      <PopoverTrigger asChild>
+        <Button aria-expanded={open} aria-label="Filter by label" role="combobox" variant="outline">
+          {selected.length ? `Labels (${selected.length})` : "Labels"}
+          <ChevronsUpDownIcon data-icon="inline-end" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-72 p-0">
+        <Command>
+          <CommandInput placeholder="Find a label…" />
+          <CommandList>
+            <CommandEmpty>No labels found.</CommandEmpty>
+            <CommandGroup>
+              {labels.map(({ label, channel_count: count }) => (
+                <CommandItem
+                  key={label}
+                  onSelect={() => update({ labels: selectedLabels.has(label) ? selected.filter((item) => item !== label) : [...selected, label] })}
+                  value={label}
+                >
+                  <CheckIcon className={cn("size-4", !selectedLabels.has(label) && "opacity-0")} />
+                  <span className="min-w-0 flex-1 truncate">{label}</span>
+                  <span className="text-muted-foreground text-xs tabular-nums">{count}</span>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
   );
 }
 
