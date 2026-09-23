@@ -60,6 +60,7 @@ const TIER_CLASSES = {
 };
 
 const FAVICON_KINDS = new Set(["favicon_mmh3", "favicon_md5"]);
+const INFRASTRUCTURE_ONLY_KINDS = new Set(["asn", "network_cidr", "nameserver"]);
 
 // Kinds whose value is encoded "<prefix>|<value>" (provider, platform, chain).
 // The backend normally splits this out into `subkind`; deriving it from the
@@ -89,6 +90,40 @@ export function linkStrength(link) {
     return STRENGTH_TIERS.moderate;
   }
   return STRENGTH_TIERS.weak;
+}
+
+// CDN and shared-hosting IPs identify a delivery network, while an origin IP
+// can identify a server a small set of domains actually shares. Keep that
+// distinction in the folding rule so the latter stays visible beside the
+// stronger analyst-facing connections.
+function isCommonInfrastructureNode(node) {
+  if (node?.kind === "shared_ip") {
+    const network = String(node.network || "").toLowerCase();
+    return network === "cdn" || network === "pool";
+  }
+  return INFRASTRUCTURE_ONLY_KINDS.has(node?.kind);
+}
+
+// A mixed link stays in the main list: one certificate, identifier, or
+// dedicated origin next to infrastructure gives the analyst material evidence
+// to inspect. An empty or malformed evidence list is equally kept visible.
+export function isInfrastructureOnlyLink(link) {
+  const evidence = link?.evidence;
+  return Array.isArray(evidence) && evidence.length > 0 && evidence.every(isCommonInfrastructureNode);
+}
+
+export function partitionInfrastructureOnlyLinks(links, canFold = () => true) {
+  return (links || []).reduce(
+    (groups, link) => {
+      if (isInfrastructureOnlyLink(link) && canFold(link)) {
+        groups.infrastructure.push(link);
+      } else {
+        groups.visible.push(link);
+      }
+      return groups;
+    },
+    { visible: [], infrastructure: [] },
+  );
 }
 
 // Tier 1-5 is an OpenCTI severity scale, not a UI state, so it keeps its own
@@ -393,6 +428,45 @@ export const EvidenceList = memo(function EvidenceList({ evidence, leftLabel, ri
   );
 });
 
+function InfrastructureConnectionsFold({ links, leftLabel, onVerdictSaved, showPair }) {
+  const [open, setOpen] = useState(false);
+  const count = links.length;
+
+  return (
+    <Collapsible className="bg-card rounded-lg border" onOpenChange={setOpen} open={open}>
+      <CollapsibleTrigger asChild>
+        <button className="hover:bg-muted/60 flex w-full items-center gap-3 rounded-lg p-3 text-left" type="button">
+          <div className="min-w-0 flex-1">
+            <span className="text-sm font-medium">
+              {count} {count === 1 ? "link shares" : "links share"} only infrastructure
+            </span>
+            <p className="text-muted-foreground mt-0.5 text-xs">
+              Shared CDN or hosting IPs, ASNs, network blocks, and nameservers need more evidence to show a relationship.
+            </p>
+          </div>
+          <ChevronDownIcon
+            className={cn("text-muted-foreground size-4 shrink-0 transition-transform", open && "rotate-180")}
+          />
+        </button>
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <div className="flex flex-col gap-2 border-t p-3">
+          {links.map((link, index) => (
+            <ConnectionRow
+              key={showPair ? `${link.a}|${link.b}` : link.target || index}
+              leftLabel={leftLabel}
+              link={link}
+              onVerdictSaved={onVerdictSaved}
+              rightLabel={showPair ? link.b : link.target}
+              showPair={showPair}
+            />
+          ))}
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
 function kindSummary(evidence) {
   const counts = new Map();
   (evidence || []).forEach((node) => {
@@ -609,3 +683,27 @@ export const ConnectionRow = memo(function ConnectionRow({ link, leftLabel, onVe
     </Collapsible>
   );
 });
+
+// Keep infrastructure-only links available without making a long shared pool
+// look like a list of independent findings. Callers may veto individual links
+// (Compare does this for pairs explicitly selected by the analyst).
+export function ConnectionList({ links, leftLabel, onVerdictSaved, showPair = false, foldInfrastructure = false }) {
+  const canFold = typeof foldInfrastructure === "function" ? foldInfrastructure : () => foldInfrastructure;
+  const { visible, infrastructure } = partitionInfrastructureOnlyLinks(links, canFold);
+
+  return (
+    <>
+      {visible.map((link, index) => (
+        <ConnectionRow
+          key={showPair ? `${link.a}|${link.b}` : link.target || index}
+          leftLabel={leftLabel}
+          link={link}
+          onVerdictSaved={onVerdictSaved}
+          rightLabel={showPair ? link.b : link.target}
+          showPair={showPair}
+        />
+      ))}
+      {infrastructure.length > 0 ? <InfrastructureConnectionsFold leftLabel={leftLabel} links={infrastructure} onVerdictSaved={onVerdictSaved} showPair={showPair} /> : null}
+    </>
+  );
+}

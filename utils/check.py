@@ -605,6 +605,21 @@ def _looks_like_cdn_network(meta: dict) -> bool:
 # "someone's own server".
 _CENSYS_SHARED_LABELS = ("cdn", "hosting", "proxy", "vpn", "tor")
 
+_MAIL_SERVICE_HOST_LABELS = frozenset({
+    "mail", "webmail", "smtp", "smtp2", "imap", "pop", "pop3", "mx",
+    "autoconfig", "autodiscover", "zmail",
+})
+
+
+def _only_mail_service_hosts(row: dict) -> bool:
+    sides = (row.get("a_hosts") or [], row.get("b_hosts") or [])
+    return all(hosts and all(_is_mail_service_host(host) for host in hosts) for hosts in sides)
+
+
+def _is_mail_service_host(host: str) -> bool:
+    label = str(host).lower().split(".", 1)[0]
+    return label in _MAIL_SERVICE_HOST_LABELS or label.startswith(("autoconfig-", "autodiscover-", "zmail-"))
+
 
 def _censys_says_shared(meta: dict) -> bool:
     """Whether Censys host enrichment classifies this IP as shared infrastructure.
@@ -676,7 +691,10 @@ def _explain_shared_ip(network: str, degree: int, meta: dict) -> str:
     return f"Looks like a dedicated origin server{suffix} — few sites sit directly on this box, a stronger signal."
 
 
-def describe_ip_network(value: str, degree: int, meta: dict | None = None, *, noisy_net: bool = False) -> dict:
+def describe_ip_network(
+    value: str, degree: int, meta: dict | None = None, *, noisy_net: bool = False,
+    mail_service_hosts: bool = False,
+) -> dict:
     """Classify + plain-language-explain what kind of box a shared IP is
     (CDN/proxy edge, shared-hosting pool, or likely dedicated origin server).
     Shared by the pairwise scorer and the domain-detail IP list so both agree."""
@@ -697,15 +715,23 @@ def describe_ip_network(value: str, degree: int, meta: dict | None = None, *, no
         or _looks_like_cdn_network(meta)
         or _censys_says_shared(meta)
     )
-    network = classify_ip_network(degree=degree, cdn=cdn)
-    return {"network": network, "explanation": _explain_shared_ip(network, degree, meta)}
+    mail_service_hosts = mail_service_hosts or (degree >= 3 and _is_mail_service_host(meta.get("ptr") or ""))
+    network = "pool" if mail_service_hosts and not cdn else classify_ip_network(degree=degree, cdn=cdn)
+    explanation = (
+        "This IP serves mail or webmail hosts. Sharing a mail service points to hosting infrastructure, not a common owner."
+        if mail_service_hosts and network == "pool" else _explain_shared_ip(network, degree, meta)
+    )
+    return {"network": network, "explanation": explanation}
 
 
 def _score_ip_row(row: dict, meta: dict | None = None) -> tuple[dict, float]:
     value = str(row.get("value") or "")
     degree = int(row.get("degree") or 0)
     meta = meta or {}
-    described = describe_ip_network(value, degree, meta, noisy_net=bool(row.get("noisy_net")))
+    described = describe_ip_network(
+        value, degree, meta, noisy_net=bool(row.get("noisy_net")),
+        mail_service_hosts=_only_mail_service_hosts(row),
+    )
     network = described["network"]
     noisy = network != "origin"
     base = selector_base_weight("shared_ip")
@@ -884,6 +910,13 @@ def _assemble_link(
     for row in _dedupe_verification_tokens(shared_selectors):
         ev, _ = _score_selector_row(row, cert_meta)
         evidence.append(ev)
+    certs = [ev for ev in evidence if ev["kind"] == "tls_cert_sha256"]
+    if certs and all((cert_meta or {}).get(ev["value"], {}).get("shared_frontend") for ev in certs):
+        for ev in evidence:
+            if ev["kind"] in {"tls_cert_sha256", "tls_spki", "tls_san"}:
+                ev["weight"] = 0.0
+                ev["attributing"] = False
+                ev["explanation"] += " This certificate was observed only on shared CDN or hosting front ends."
     if ip_meta is None:
         ip_meta = intel_db.ip_network_context([str(row.get("value") or "") for row in shared_ips])
     for row in shared_ips:

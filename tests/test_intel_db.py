@@ -743,7 +743,7 @@ class IntelDbTests(unittest.TestCase):
                 "dns": {"NS": ["ns1.cloudflare.com", "ns2.cloudflare.com"]},
                 "non_cf_tls_certs": [
                     {"ip": "203.0.113.51", "port": 443, "cn": "noisy.example",
-                     "sans": ["localhost"], "sha256": "abc123"}
+                     "sans": ["noisy.example", "localhost"], "sha256": "abc123"}
                 ],
             }
         )

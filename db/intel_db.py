@@ -1806,6 +1806,29 @@ def _normalize_tls_identity(value: Any) -> str:
     return text[4:] if text.startswith("www.") else text
 
 
+def _certificate_covers_host(cert: Mapping[str, Any], host: str) -> bool:
+    """Reject a probe's default certificate when it names another site."""
+    info = classify_entity(host)
+    if not info or info["kind"] == "ip":
+        return True
+    names = cert.get("sans") or [cert.get("cn")]
+    if isinstance(names, str):
+        names = [names]
+    names = [str(name or "").strip().lower().rstrip(".") for name in names]
+    names = [name for name in names if name]
+    if not names:
+        return True  # No identity to verify in this probe.
+    target = info["value"]
+    for name in names:
+        if target == name:
+            return True
+        if name.startswith("*."):
+            suffix = name[2:]
+            if target.endswith("." + suffix) and target.count(".") == suffix.count(".") + 1:
+                return True
+    return False
+
+
 def _text_contains_any(value: Any, patterns: tuple[str, ...]) -> bool:
     text = str(value or "").strip().lower()
     if not text:
@@ -4168,6 +4191,18 @@ def extract_selectors(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
             return
         ts = str(res.get("timestamp") or datetime.now(timezone.utc).isoformat())
         owner = register_host(res.get("input"), ts, ts)
+        owner_info = classify_entity(owner) if owner else None
+        owner_rd = owner_info.get("registrable_domain") if owner_info else None
+        own_urlscan_ips: set[str] = set()
+        for hit in _as_dict(res.get("urlscan")).get("hits") or []:
+            if not isinstance(hit, Mapping) or hit.get("third_party_scan") is True:
+                continue
+            try:
+                scanned_host = urlsplit(str(hit.get("url") or "")).hostname
+            except ValueError:
+                continue
+            if scanned_host and owner_rd and registrable_domain(scanned_host) == owner_rd and hit.get("ip"):
+                own_urlscan_ips.add(str(hit["ip"]))
 
         # ── TLS certs (live probes + origin scans) exhibited by the owner ──
         # The live pipeline (core/basic.py::get_tls_certs, run on every scan) stores
@@ -4182,6 +4217,8 @@ def extract_selectors(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
         tls_list.extend((res.get("tls_certs") or {}).get("probes") or [])
         for cert in tls_list:
             if not isinstance(cert, Mapping) or cert.get("error"):
+                continue
+            if owner and not _certificate_covers_host(cert, owner):
                 continue
             fingerprint = cert.get("sha256") or cert.get("fingerprint_sha256")
             if owner:
@@ -4201,6 +4238,8 @@ def extract_selectors(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
                 continue
             for hit in scan_result.get("hits") or []:
                 if not isinstance(hit, Mapping):
+                    continue
+                if owner and not _certificate_covers_host(hit, owner):
                     continue
                 if owner:
                     add_obs(owner, "tls_cert_sha256", _normalize_identifier_hash(hit.get("sha256")), scan_src, ts, ts)
@@ -4239,8 +4278,16 @@ def extract_selectors(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
         ip_details = normalize_ip_details(res.get("ip_details"))
         for ip, info in ip_details.items():
             if owner:
-                src = (info.get("sources") or ["dns"])[0]
-                add_resolves(owner, ip, str(src), ts, ts)
+                sources = info.get("sources") or ["dns"]
+                if isinstance(sources, str):
+                    sources = [sources]
+                source_set = {str(source).lower() for source in sources}
+                # A URLScan hit for an unrelated page can be discovered while
+                # investigating this domain. Its IP belongs to that page, not
+                # to the investigated host (example.com -> fnn.jp is one such
+                # case). Keep it as raw intel but do not invent a host-IP edge.
+                if source_set != {"urlscan"} or ip in own_urlscan_ips:
+                    add_resolves(owner, ip, str(sources[0]), ts, ts)
             asn_info = info.get("asn_info") or {}
             # Provenance was "rdap" until the RDAP leg was removed from
             # core.basic.get_ip_whois; ASN now comes from ipinfo Lite and the
@@ -5883,13 +5930,32 @@ def tls_cert_context(sha256_values: list[str]) -> dict[str, dict[str, Any]]:
     init_db()
     with _conn() as c:
         rows = c.execute(
-            """SELECT DISTINCT ON (sha256) sha256, cn, issuer_cn, issuer_org, not_before, not_after
-               FROM tls_certs
-               WHERE sha256 = ANY(%s)
-               ORDER BY sha256, observed_at DESC NULLS LAST, id DESC""",
+            """SELECT t.sha256, t.ip, t.cn, t.issuer_cn, t.issuer_org,
+                      t.not_before, t.not_after
+               FROM tls_certs t
+               WHERE t.sha256 = ANY(%s)
+               ORDER BY t.sha256, t.observed_at DESC NULLS LAST, t.id DESC""",
             (values,),
         ).fetchall()
-    return {row["sha256"]: dict(row) for row in rows}
+    context: dict[str, dict[str, Any]] = {}
+    ips_by_sha: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        context.setdefault(row["sha256"], dict(row))
+        if row["ip"]:
+            ips_by_sha[row["sha256"]].add(row["ip"])
+    ip_meta = ip_network_context(sorted({ip for ips in ips_by_sha.values() for ip in ips}))
+    from utils.check import describe_ip_network
+
+    for sha, cert in context.items():
+        ips = ips_by_sha[sha]
+        # A certificate observed only on shared front ends is evidence of that
+        # platform, not of a common operator. An origin observation preserves
+        # its usual weight because the same certificate may also be deployed
+        # on the operator's own server.
+        cert["shared_frontend"] = bool(ips) and all(
+            describe_ip_network(ip, 2, ip_meta.get(ip))["network"] != "origin" for ip in ips
+        )
+    return context
 
 
 def link_candidates_for(value: str) -> dict[str, dict[str, list[dict[str, Any]]]]:
@@ -6166,7 +6232,7 @@ def rebuild_clusters() -> dict[str, int]:
         ).fetchall():
             union_group(row["rds"], {"node_type": "selector", "kind": row["kind"], "value": row["value"]})
 
-        for row in c.execute(
+        ip_connectors = c.execute(
             """SELECT ip.value, array_agg(DISTINCT e.registrable_domain) AS rds
                FROM entities ip
                JOIN entity_edges ee ON ee.dst_entity_id = ip.id AND ee.kind = 'resolves_to'
@@ -6179,7 +6245,13 @@ def rebuild_clusters() -> dict[str, int]:
                GROUP BY ip.id
                HAVING count(DISTINCT e.registrable_domain) BETWEEN 2 AND %s""",
             (fanout,),
-        ).fetchall():
+        ).fetchall()
+        from utils.check import describe_ip_network
+
+        ip_meta = ip_network_context([row["value"] for row in ip_connectors])
+        for row in ip_connectors:
+            if describe_ip_network(row["value"], len(row["rds"]), ip_meta.get(row["value"]))["network"] != "origin":
+                continue
             union_group(row["rds"], {"node_type": "ip", "kind": "shared_ip", "value": row["value"]})
 
         components: dict[str, list[str]] = defaultdict(list)
@@ -7013,19 +7085,37 @@ def domains_by_selector(
     *, kind: str | None = None, min_domains: int = 2, limit: int = 200
 ) -> list[dict[str, Any]]:
     """Groups of registrable domains that share an attributing selector (or a
-    non-noise shared IP when kind='shared_ip'), strongest fan-in first. Reads
-    the materialized graph_selector_groups table — see rebuild_clusters."""
+    non-noise shared IP when kind='shared_ip'), most telling first. Reads the
+    materialized graph_selector_groups table — see rebuild_clusters."""
     init_db()
     with _conn() as c:
         rows = c.execute(
             """SELECT kind, value, degree, domains
                FROM graph_selector_groups
                WHERE degree >= %s AND (%s::text IS NULL OR kind = %s::text)
-               ORDER BY degree DESC, kind, value
-               LIMIT %s""",
-            (min_domains, kind, kind, limit),
+               ORDER BY kind, value""",
+            (min_domains, kind, kind),
         ).fetchall()
-    return [dict(row) for row in rows]
+    from utils.check import describe_ip_network, rarity_weight
+    from utils.evidence_meta import selector_base_weight
+
+    groups = [dict(row) for row in rows]
+    ip_meta = ip_network_context([row["value"] for row in groups if row["kind"] == "shared_ip"])
+    cert_meta = tls_cert_context([row["value"] for row in groups if row["kind"] == "tls_cert_sha256"])
+    for row in groups:
+        kind_name, degree = row["kind"], int(row["degree"])
+        rarity = rarity_weight(degree)
+        weight = selector_base_weight(kind_name, row["value"]) * rarity
+        infrastructure = kind_name in {"asn", "network_cidr", "nameserver"}
+        if kind_name == "shared_ip":
+            infrastructure = describe_ip_network(row["value"], degree, ip_meta.get(row["value"]))["network"] != "origin"
+        elif kind_name == "tls_cert_sha256":
+            infrastructure = bool(cert_meta.get(row["value"], {}).get("shared_frontend"))
+        row["attributing_weight"] = round(0.0 if infrastructure else weight, 2)
+        row["rarity"] = round(rarity, 3)
+        row["noise"] = infrastructure or weight < 20
+    groups.sort(key=lambda row: (row["noise"], -row["attributing_weight"], row["degree"], row["kind"], row["value"]))
+    return groups[:limit]
 
 
 def domains_for_selector_value(kind: str, value: str, limit: int = 10) -> list[str]:

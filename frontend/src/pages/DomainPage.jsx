@@ -23,7 +23,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
-  ConnectionRow,
+  ConnectionList,
   CopyValue,
   FaviconThumb,
   ProvenanceBadge,
@@ -230,9 +230,7 @@ function DirectConnections({ value, links, onVerdictSaved, request }) {
       ) : null}
       {visible.length > 0 ? (
         <div className="flex flex-col gap-2">
-          {visible.map((link) => (
-            <ConnectionRow key={link.target} leftLabel={value} link={link} onVerdictSaved={onVerdictSaved} rightLabel={link.target} />
-          ))}
+          <ConnectionList foldInfrastructure leftLabel={value} links={visible} onVerdictSaved={onVerdictSaved} />
           {/* Never truncate silently: 25 connections and 250 look the same
               otherwise. */}
           {links.length > INITIAL_CONNECTIONS ? (

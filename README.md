@@ -248,7 +248,7 @@ token. Graph recompute and graph email require the `admin` role.
 - `GET /api/graph/links/{value}` — ranked cross-corpus connections for one channel, each with its shared-node evidence breakdown (selector kind, value, degree, weight, time-overlap window, sources).
 - `GET /api/graph/link?a=<rd>&b=<rd>` — the connecting evidence between two channels.
 - `GET /api/graph/selector-kinds` — the edge types available for browsing (selector kind / `shared_ip`) and how many cross-channel groups each forms.
-- `GET /api/graph/by-selector?kind=<kind>&min_domains=2` — browse **by edge type**: groups of channels that share a selector of `kind` (e.g. every set of channels sharing a TLS cert / SSH key / IP). Omit `kind` for all edge types.
+- `GET /api/graph/by-selector?kind=<kind>&min_domains=2` — browse **by edge type**: groups of channels that share a selector of `kind` (e.g. every set of channels sharing a TLS cert / SSH key / IP). Omit `kind` for all edge types. Groups are ranked by `attributing_weight` (base weight × rarity), with `noise` marking shared infrastructure; the page hides these common values until requested.
 - `GET /api/graph/clusters` — the strongest clusters lake-wide.
 - `GET /api/graph/cluster/{value}` — the cluster a channel belongs to, with members.
 - `GET /api/graph/path?a=<rd>&b=<rd>` — the precomputed shortest evidence chain connecting two channels, hop by hop (`db/intel_db.py`'s `path_between` / `graph_paths` table — see [Multi-hop path precompute](#multi-hop-path-precompute)). 404 if no path exists within the configured hop limit.
@@ -340,6 +340,9 @@ overlap score higher than the same selector seen years apart. Base weights and
 strength tiers live in `utils/evidence_meta.py`; the linkage/scoring engine is in
 `utils/check.py` (`link_evidence`, `links_for`); clustering is connected
 components over the whole attributing graph (`graph_clusters`).
+Shared IPs classified as CDN, hosting pools, or provider mail infrastructure
+do not join cluster components; a full recompute can therefore split clusters
+that were held together only by those IPs.
 
 Related measurements do not add independent points: each pair receives only
 the strongest adjusted contribution from its favicon matches and only the
@@ -349,6 +352,16 @@ matches remain in the evidence breakdown. `weight` is the actual contribution;
 a conservative family-level cap because stored selectors do not reliably
 identify independent assets. It also caps repeated certificates or favicons
 within the same family; independent evidence from other families still adds.
+
+Mail and webmail host overlaps are classified as shared hosting even when the
+IP has fewer than 50 observed channels. TLS probes whose certificate names do
+not cover the probed domain contribute neither certificate nor IP evidence;
+certificates seen only on recognized shared CDN/hosting front ends also carry
+zero attribution weight. IPs found only through URLScan results for third-party
+pages are retained as raw intel but do not become host-IP graph edges. A full
+graph recompute applies these projection filters to previously stored scans.
+The UI folds infrastructure-only direct connections
+until expanded, while selected Compare pairs remain visible.
 
 Recognized DNS TXT verification proofs now share the `site_verification`
 selector namespace and existing weight with HTML verification codes. Provider

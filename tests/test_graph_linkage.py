@@ -49,6 +49,33 @@ class GraphScoringMathTests(unittest.TestCase):
         # Unknown windows → full credit.
         self.assertEqual(check.time_overlap_factor(None, None, None, None), 1.0)
 
+    def test_zoner_webmail_ip_is_shared_hosting_even_below_degree_ceiling(self) -> None:
+        row = {
+            "value": "217.198.120.6", "degree": 47,
+            "a_hosts": ["webmail.jancarik.cz"],
+            "b_hosts": ["webmail.advin.cz"],
+        }
+        evidence, weight = check._score_ip_row(row, {"ptr": "zmail.zoner.com"})
+        self.assertEqual(evidence["network"], "pool")
+        self.assertEqual(weight, 0)
+        self.assertFalse(evidence["attributing"])
+        self.assertEqual(check.describe_ip_network("217.198.120.6", 47, {"ptr": "zmail.zoner.com"})["network"], "pool")
+
+    def test_cdn_certificate_and_san_do_not_restore_ip_score(self) -> None:
+        cert = "3c0787eb125d5fc40438759e8aa9ecf72774222496db40042a1e94717f881e93"
+        selectors = [
+            {"kind": "tls_cert_sha256", "value": cert, "entity_count": 2},
+            {"kind": "tls_san", "value": "fnn.jp", "entity_count": 2},
+        ]
+        ips = [{"value": "3.175.246.31", "degree": 2}]
+        link = check._assemble_link(
+            selectors, ips,
+            ip_meta={"3.175.246.31": {"ptr": "server-3-175-246-31.prg50.r.cloudfront.net"}},
+            cert_meta={cert: {"shared_frontend": True, "cn": "*.fnn.jp"}},
+        )
+        self.assertEqual(link["score"], 0)
+        self.assertTrue(all(not evidence["attributing"] for evidence in link["evidence"]))
+
 
 class ProjectionTests(unittest.TestCase):
     """What extract_selectors pulls out of a stored result — no database.
@@ -97,6 +124,41 @@ class ProjectionTests(unittest.TestCase):
                 })
                 self.assertEqual(evidence["recency"], check._RECENCY_FLOOR)
                 self.assertLess(weight, evidence["base_weight"])
+
+    def test_example_com_default_certificate_for_fnn_jp_is_not_attributed(self) -> None:
+        cert = {
+            "ip": "163.49.35.64", "sni_used": "example.com",
+            "cn": "*.fnn.jp", "sans": ["*.fnn.jp", "fnn.jp"],
+            "fingerprint_sha256": "3c0787eb125d5fc40438759e8aa9ecf72774222496db40042a1e94717f881e93",
+        }
+        example = self._project({"tls_certs": {"probes": [cert]}})
+        self.assertFalse(any(o["kind"].startswith("tls_") for o in example["observations"]))
+        self.assertFalse(any(e["source"] == "tls" for e in example["edges"]))
+        owner = intel_db.extract_selectors({
+            "input": "fnn.jp", "type": "domain", "timestamp": "2026-08-01T00:00:00+00:00",
+            "tls_certs": {"probes": [{**cert, "sni_used": "fnn.jp"}]},
+        })
+        self.assertTrue(any(o["kind"] == "tls_cert_sha256" for o in owner["observations"]))
+
+    def test_third_party_urlscan_ip_is_not_projected_onto_scanned_domain(self) -> None:
+        foreign_ip = "163.49.35.64"
+        example = self._project({
+            "urlscan": {"hits": [{
+                "ip": foreign_ip, "url": "https://www.fnn.jp/articles/-/1119530",
+                "third_party_scan": True,
+            }]},
+            "ip_details": {foreign_ip: {"sources": ["urlscan"]}},
+        })
+        self.assertFalse(any(e["dst"] == foreign_ip and e["kind"] == "resolves_to" for e in example["edges"]))
+
+        own = self._project({
+            "urlscan": {"hits": [{
+                "ip": foreign_ip, "url": "https://example.com/",
+                "third_party_scan": False,
+            }]},
+            "ip_details": {foreign_ip: {"sources": ["urlscan"]}},
+        })
+        self.assertTrue(any(e["dst"] == foreign_ip and e["source"] == "urlscan" for e in own["edges"]))
 
     # ── WHOIS registrant identity ──
     def test_registrant_email_lands_on_contact_email(self) -> None:
@@ -315,6 +377,34 @@ class GraphLinkageDbTests(unittest.TestCase):
         self.assertTrue(shared)
         self.assertTrue(shared[0]["noisy_net"])
 
+    def test_certificate_seen_only_on_cdn_edges_has_no_owner_weight(self) -> None:
+        for domain, ip in (("a.com", "3.175.246.31"), ("b.com", "3.175.246.32")):
+            intel_db.save_search({
+                "input": domain, "type": "domain", "timestamp": "2026-09-23T00:00:00+00:00",
+                "ip_details": {ip: {"ptr": f"server-{ip.replace('.', '-')}.prg50.r.cloudfront.net", "sources": ["dns_a"]}},
+                "tls_certs": {"probes": [{
+                    "ip": ip, "sni_used": domain, "cn": "a.com", "sans": ["a.com", "b.com"],
+                    "fingerprint_sha256": "shared-cdn-cert",
+                }]},
+            })
+        context = intel_db.tls_cert_context(["shared-cdn-cert"])
+        self.assertTrue(context["shared-cdn-cert"]["shared_frontend"])
+        link = check.link_evidence("a.com", "b.com")
+        self.assertEqual(link["score"], 0)
+        self.assertTrue(all(ev["weight"] == 0 for ev in link["evidence"]))
+
+    def test_provider_mail_ip_does_not_join_clusters(self) -> None:
+        ip = "217.198.120.97"
+        for domain in ("a.com", "b.com", "c.com"):
+            intel_db.save_search({
+                "input": f"smtp.{domain}", "type": "domain", "timestamp": "2026-09-23T00:00:00+00:00",
+                "ip_details": {ip: {"ptr": "smtp.zoner.com", "sources": ["dns_a"]}},
+                "dns": {"A": [ip]},
+            })
+        intel_db.rebuild_all_correlation()
+        self.assertEqual(check.link_evidence("a.com", "b.com")["score"], 0)
+        self.assertIsNone(intel_db.graph_cluster_for("a.com"))
+
     def test_global_clustering_groups_linked_domains(self) -> None:
         intel_db.save_search(self._apex_cert_scan("a.com", "203.0.113.1", "rarecert", "2026-03-01T00:00:00+00:00"))
         intel_db.save_search(self._apex_cert_scan("b.com", "203.0.113.2", "rarecert", "2026-03-02T00:00:00+00:00"))
@@ -396,6 +486,22 @@ class GraphLinkageDbTests(unittest.TestCase):
         self.assertEqual(
             [g for g in intel_db.domains_by_selector(kind="favicon_mmh3")], []
         )
+
+    def test_shared_evidence_ranks_rare_certificate_above_large_hosting_ip(self) -> None:
+        with intel_db._conn() as c:
+            c.execute(
+                """INSERT INTO graph_selector_groups (kind, value, degree, domains)
+                   VALUES (%s, %s, %s, %s), (%s, %s, %s, %s)""",
+                (
+                    "shared_ip", "217.198.114.96", 355, ["jancarik.cz", "advin.cz"],
+                    "tls_cert_sha256", "rare-cert", 2, ["a.com", "b.com"],
+                ),
+            )
+        groups = intel_db.domains_by_selector()
+        self.assertEqual([group["kind"] for group in groups], ["tls_cert_sha256", "shared_ip"])
+        self.assertGreater(groups[0]["attributing_weight"], 0)
+        self.assertEqual(groups[1]["attributing_weight"], 0)
+        self.assertTrue(groups[1]["noise"])
 
     def test_domain_profile_shows_intel_without_connections(self) -> None:
         # A lone channel with no shared evidence still has a full profile.

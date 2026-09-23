@@ -18,7 +18,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import DomainPicker from "@/features/DomainPicker.jsx";
-import { ConnectionRow, ScoreHelp, StrengthDot } from "@/features/evidence.jsx";
+import { ConnectionList, ConnectionRow, ScoreHelp, StrengthDot } from "@/features/evidence.jsx";
 import ExportMenu from "@/features/ExportMenu.jsx";
 import { domainUrl } from "@/lib/routes.js";
 
@@ -205,7 +205,7 @@ export default function ComparePage() {
             </TabsContent>
             {result.pool_links ? (
               <TabsContent className="pt-4" value="pool">
-                <PoolLinksPanel poolLinks={result.pool_links} />
+                <PoolLinksPanel poolLinks={result.pool_links} seedSet={seedSet} />
               </TabsContent>
             ) : null}
           </Tabs>
@@ -297,7 +297,7 @@ export function PairsPanel({ pairs, seedSet, expandedCount, onVerdictSaved }) {
   );
 }
 
-function PoolLinksPanel({ poolLinks }) {
+function PoolLinksPanel({ poolLinks, seedSet }) {
   const entries = Object.entries(poolLinks || {});
   if (entries.length === 0) {
     return null;
@@ -318,9 +318,11 @@ function PoolLinksPanel({ poolLinks }) {
           >
             {links.length > 0 ? (
               <div className="flex flex-col gap-2">
-                {links.slice(0, 8).map((link) => (
-                  <ConnectionRow key={link.target} leftLabel={domain} link={link} rightLabel={link.target} />
-                ))}
+                <ConnectionList
+                  foldInfrastructure={(link) => !seedSet.has(link.target)}
+                  leftLabel={domain}
+                  links={links.slice(0, 8)}
+                />
                 {links.length > 8 ? (
                   <Link className="text-muted-foreground text-sm hover:underline" to={domainUrl(domain)}>
                     See all {links.length} on the channel page →
