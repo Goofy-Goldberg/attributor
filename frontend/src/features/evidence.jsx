@@ -1,17 +1,20 @@
+import { ArrowRightIcon, ChevronDownIcon, CopyIcon, InfoIcon } from "lucide-react";
 import { memo, useState } from "react";
-import { Badge, Card, Text, View } from "reshaped";
+import { Link } from "react-router";
+import { toast } from "sonner";
 
-import {
-  formatDate,
-  formatLabel,
-  formatNumber,
-} from "../api.js";
-import { EmptyState } from "../components/primitives.jsx";
+import { formatDate, formatLabel, formatNumber } from "@/api.js";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { domainUrl } from "@/lib/routes.js";
+import { cn } from "@/lib/utils";
 
 const STRENGTH_TIERS = {
-  strong: { tier: "strong", label: "Strong evidence", color: "positive" },
-  moderate: { tier: "moderate", label: "Moderate evidence", color: "warning" },
-  weak: { tier: "weak", label: "Weak evidence", color: "neutral" },
+  strong: { tier: "strong", label: "Strong", dot: "bg-strength-strong" },
+  moderate: { tier: "moderate", label: "Moderate", dot: "bg-strength-moderate" },
+  weak: { tier: "weak", label: "Weak", dot: "bg-strength-weak" },
 };
 
 const SELECTOR_KIND_LABELS = {
@@ -40,17 +43,17 @@ const SELECTOR_KIND_LABELS = {
 };
 
 const IP_NETWORK_BADGES = {
-  cdn: { label: "CDN / proxy edge", color: "neutral" },
-  pool: { label: "Shared hosting pool", color: "warning" },
-  origin: { label: "Likely origin server", color: "positive" },
+  cdn: { label: "CDN / proxy edge", variant: "outline" },
+  pool: { label: "Shared hosting pool", variant: "outline" },
+  origin: { label: "Likely origin server", variant: "secondary" },
 };
 
-const DOMAIN_TIER_COLORS = {
-  1: "#b91c1c",
-  2: "#ea580c",
-  3: "#ca8a04",
-  4: "#2563eb",
-  5: "#64748b",
+const TIER_CLASSES = {
+  1: "bg-tier-1",
+  2: "bg-tier-2",
+  3: "bg-tier-3",
+  4: "bg-tier-4",
+  5: "bg-tier-5",
 };
 
 const FAVICON_KINDS = new Set(["favicon_mmh3", "favicon_md5"]);
@@ -59,6 +62,9 @@ const FAVICON_KINDS = new Set(["favicon_mmh3", "favicon_md5"]);
 // The backend normally splits this out into `subkind`; deriving it from the
 // encoding is the fallback so a wallet never reads as raw "bitcoin|bc1q...".
 const PREFIXED_VALUE_KINDS = new Set(["tracking_id", "site_verification", "social_handle", "crypto_wallet"]);
+
+export const SCORE_EXPLAINER =
+  "The match score adds up the weight of every piece of shared evidence, discounted for how common and how stale it is. Higher means more and rarer shared evidence — it is not a probability of common ownership.";
 
 export function sharedNodeLabel(kind) {
   return SELECTOR_KIND_LABELS[kind] || formatLabel(kind);
@@ -82,54 +88,62 @@ export function linkStrength(link) {
   return STRENGTH_TIERS.weak;
 }
 
-export function TierBadge({ tier }) {
-  if (!DOMAIN_TIER_COLORS[tier]) {
+// Tier 1-5 is an OpenCTI severity scale, not a UI state, so it keeps its own
+// fixed data palette (shared with the graph) rather than a badge variant.
+export function TierBadge({ tier, className }) {
+  if (!TIER_CLASSES[tier]) {
     return null;
   }
-  // Tier 1-5 is an OpenCTI severity scale, not a UI state -- kept on its own
-  // fixed hex palette (like ClusterGraph's DOMAIN_TIER_COLORS) rather than
-  // Reshaped's 5-color semantic Badge palette, which doesn't have room for a
-  // 5-step severity gradient. Badge is still used for consistent shape/sizing.
   return (
-    <Badge
-      attributes={{
-        title: `OpenCTI tier ${tier} (1 = highest priority)`,
-        style: { background: DOMAIN_TIER_COLORS[tier], color: "#fff" },
-      }}
-      size="small"
-    >
-      Tier {tier}
-    </Badge>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge className={cn("border-transparent text-white", TIER_CLASSES[tier], className)}>T{tier}</Badge>
+      </TooltipTrigger>
+      <TooltipContent>OpenCTI tier {tier} (1 = highest priority)</TooltipContent>
+    </Tooltip>
   );
 }
 
 export function ProvenanceBadge({ ingested }) {
   return (
-    <Badge
-      attributes={{
-        title: ingested
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge variant={ingested ? "secondary" : "outline"}>{ingested ? "Ingested" : "Discovered"}</Badge>
+      </TooltipTrigger>
+      <TooltipContent>
+        {ingested
           ? "Directly submitted, or a subdomain of it was."
-          : "Surfaced by following a scan: subdomain, sibling, or wordlist discovery.",
-      }}
-      color={ingested ? "positive" : "primary"}
-      size="small"
-      variant="faded"
-    >
-      {ingested ? "Ingested" : "Discovered"}
-    </Badge>
+          : "Surfaced by following a scan: subdomain, sibling, or wordlist discovery."}
+      </TooltipContent>
+    </Tooltip>
   );
 }
 
-export function ConnectionStat({ count }) {
+export function StrengthDot({ link, className }) {
+  const strength = linkStrength(link);
+  return <span aria-hidden className={cn("inline-block size-2 shrink-0 rounded-full", strength.dot, className)} />;
+}
+
+export function StrengthLabel({ link }) {
+  const strength = linkStrength(link);
   return (
-    <View direction="row" gap={1} align="baseline">
-      <Text variant="body-1" weight="bold">
-        {formatNumber(count)}
-      </Text>
-      <Text color="neutral-faded" variant="body-2">
-        {count === 1 ? "connection" : "connections"}
-      </Text>
-    </View>
+    <span className="inline-flex items-center gap-1.5 text-xs">
+      <StrengthDot link={link} />
+      {strength.label}
+    </span>
+  );
+}
+
+export function ScoreHelp() {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button aria-label="What is the match score?" className="text-muted-foreground hover:text-foreground" type="button">
+          <InfoIcon className="size-3.5" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-xs">{SCORE_EXPLAINER}</TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -141,13 +155,41 @@ export const FaviconThumb = memo(function FaviconThumb({ kind, value }) {
   return (
     <img
       alt=""
-      className="favicon-thumb"
+      className="size-4 shrink-0 rounded-sm"
       loading="lazy"
       onError={() => setFailed(true)}
       src={`/api/favicon/${encodeURIComponent(kind)}/${encodeURIComponent(value)}`}
     />
   );
 });
+
+export function CopyValue({ value, display, className }) {
+  const copy = async (event) => {
+    event.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(String(value));
+      toast.success("Copied to clipboard");
+    } catch {
+      toast.error("Could not copy — select the text instead.");
+    }
+  };
+  return (
+    <span className={cn("group/copy inline-flex max-w-full min-w-0 items-center gap-1", className)}>
+      <span className="truncate font-mono text-xs" title={String(value)}>
+        {display ?? value}
+      </span>
+      <Button
+        aria-label="Copy value"
+        className="opacity-0 group-hover/copy:opacity-100 focus-visible:opacity-100"
+        onClick={copy}
+        size="icon-xs"
+        variant="ghost"
+      >
+        <CopyIcon />
+      </Button>
+    </span>
+  );
+}
 
 function sharedNodeDisplay(node) {
   const separator = String(node.value).indexOf("|");
@@ -174,245 +216,250 @@ function formatWindow(range) {
   return formatDate(first || last);
 }
 
-// Client-side "expired/valid" read of a tls_cert_sha256 node's own
-// not_after (the CA-issued expiry, not our scan history) — a quick visual
-// flag next to "noise"/"aging" so an investigator doesn't have to parse the
-// validity-window caption to know if the certificate is still alive.
-function certExpiryBadge(node) {
+function present(value) {
+  return value !== null && value !== undefined;
+}
+
+// Client-side "expired/valid" read of a tls_cert_sha256 node's own not_after
+// (the CA-issued expiry, not our scan history).
+function certExpired(node) {
   if (node.kind !== "tls_cert_sha256" || !node.certNotAfter) {
     return null;
   }
   const notAfter = new Date(node.certNotAfter);
-  if (Number.isNaN(notAfter.getTime())) {
-    return null;
-  }
-  const expired = notAfter.getTime() < Date.now();
+  return Number.isNaN(notAfter.getTime()) ? null : notAfter.getTime() < Date.now();
+}
+
+function Metric({ label, value, help }) {
   return (
-    <Badge color={expired ? "critical" : "positive"} size="small" variant="faded">
-      {expired ? "cert expired" : "cert valid"}
-    </Badge>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div className="flex cursor-help flex-col">
+          <dt className="text-muted-foreground text-[11px]">{label}</dt>
+          <dd className="text-sm font-medium tabular-nums">{value}</dd>
+        </div>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-xs">{help}</TooltipContent>
+    </Tooltip>
   );
 }
 
-function InfoBadge({ title, children }) {
-  return (
-    <Badge attributes={{ title }} color="neutral" size="small" variant="faded">
-      {children}
-    </Badge>
-  );
-}
+function EvidenceItem({ node, leftLabel, rightLabel }) {
+  const network = node.kind === "shared_ip" ? ipNetworkBadge(node.network) : null;
+  const { label, value } = sharedNodeDisplay(node);
+  const extraA = extraHosts(leftLabel, node.hostsA);
+  const extraB = extraHosts(rightLabel, node.hostsB);
+  const expired = certExpired(node);
+  const context = [node.asnDesc, node.networkName, node.proxyFamily].filter(Boolean);
 
-const SharedNodeList = memo(function SharedNodeList({ evidence, leftLabel, rightLabel }) {
-  if (!evidence || evidence.length === 0) {
-    return <EmptyState message="No shared attributing nodes; the connection is unsupported." />;
-  }
   return (
-    <View as="ul" gap={3} attributes={{ style: { listStyle: "none", padding: 0, margin: 0 } }}>
-      {evidence.map((node) => {
-        const badge = node.kind === "shared_ip" ? ipNetworkBadge(node.network) : null;
-        const { label, value } = sharedNodeDisplay(node);
-        const extraA = extraHosts(leftLabel, node.hostsA);
-        const extraB = extraHosts(rightLabel, node.hostsB);
-        return (
-          <View as="li" key={node.id}>
-            <Card padding={3}>
-              <View gap={2}>
-                <View align="center" direction="row" gap={2} wrap>
-                  <Text weight="semibold">{label}</Text>
-                  {badge ? (
-                    <Badge color={badge.color} size="small" variant="faded">
-                      {badge.label}
-                    </Badge>
-                  ) : null}
-                  {node.attributing === false ? (
-                    <Badge color="critical" size="small" variant="faded">
-                      noise
-                    </Badge>
-                  ) : null}
-                  {node.degraded ? (
-                    <Badge attributes={{ title: "Discounted for being common and/or stale — see the note below" }} color="warning" size="small" variant="faded">
-                      aging
-                    </Badge>
-                  ) : null}
-                  {certExpiryBadge(node)}
-                </View>
-                <View align="center" direction="row" gap={1} wrap>
-                  <FaviconThumb kind={node.kind} value={node.value} />
-                  <Badge attributes={{ title: node.value }} color="primary" size="small" variant="faded">
-                    {value}
+    <li className={cn("flex flex-col gap-3 rounded-lg border p-3", node.attributing === false && "opacity-70")}>
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="flex min-w-0 flex-col gap-1">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-sm font-medium">{label}</span>
+            {network ? <Badge variant={network.variant}>{network.label}</Badge> : null}
+            {node.attributing === false ? <Badge variant="destructive">Noise</Badge> : null}
+            {node.degraded ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Badge className="text-warning border-warning/40" variant="outline">
+                    Discounted
                   </Badge>
-                  {node.degree !== null && node.degree !== undefined ? (
-                    <InfoBadge title="Entities that share this node (lower is rarer)">degree {node.degree}</InfoBadge>
-                  ) : null}
-                  {node.baseWeight !== null && node.baseWeight !== undefined ? (
-                    <InfoBadge title="Starting weight for this evidence kind, before rarity/overlap/recency attenuate it">base {node.baseWeight}</InfoBadge>
-                  ) : null}
-                  {node.rarity !== null && node.rarity !== undefined ? (
-                    <InfoBadge title="Inverse-frequency factor from degree — 1.0 is as rare as it gets, decays toward 0 the more entities share it">rarity {node.rarity}</InfoBadge>
-                  ) : null}
-                  {node.contribution !== null && node.contribution !== undefined ? (
-                    <InfoBadge title="Points this match adds to the total score">adds {formatNumber(node.contribution ?? node.weight)} points</InfoBadge>
-                  ) : null}
-                  {node.rawWeight !== null && node.rawWeight !== undefined ? (
-                    <InfoBadge title="Points before related measurements are counted together">before adjustment {formatNumber(node.rawWeight)}</InfoBadge>
-                  ) : null}
-                  {node.evidenceGroup ? (
-                    <InfoBadge title="Related measurements are counted together">{formatLabel(node.evidenceGroup)}</InfoBadge>
-                  ) : null}
-                  {node.timeOverlap !== null && node.timeOverlap !== undefined ? (
-                    <InfoBadge title="Time-window overlap factor — do the two sides' own sighting windows agree with each other">overlap {node.timeOverlap}</InfoBadge>
-                  ) : null}
-                  {node.recency !== null && node.recency !== undefined && node.recency < 1 ? (
-                    <InfoBadge title="Staleness factor — how long ago this was last seen at all, regardless of overlap (lower = older)">recency {node.recency}</InfoBadge>
-                  ) : null}
-                  {node.asnDesc ? <InfoBadge title="Network operator">{node.asnDesc}</InfoBadge> : null}
-                  {node.networkName ? <InfoBadge title="RDAP network name">{node.networkName}</InfoBadge> : null}
-                  {node.proxyFamily ? (
-                    <InfoBadge title="Detected reverse-proxy family">{node.proxyFamily}</InfoBadge>
-                  ) : null}
-                </View>
-                {node.explanation ? (
-                  <Text color="neutral-faded" variant="caption-1">
-                    {node.explanation}
-                  </Text>
-                ) : null}
-                {node.scoringNote ? (
-                  <Text color="neutral-faded" variant="caption-1">
-                    {node.scoringNote}
-                  </Text>
-                ) : null}
-                {node.kind === "tls_cert_sha256" && (node.certCn || node.certIssuerCn || node.certNotAfter) ? (
-                  <View gap={1}>
-                    {node.certCn ? (
-                      <Text color="neutral-faded" variant="caption-1">
-                        Certificate CN: <Text weight="medium">{node.certCn}</Text>
-                      </Text>
-                    ) : null}
-                    {node.certIssuerCn || node.certIssuerOrg ? (
-                      <Text color="neutral-faded" variant="caption-1">
-                        Issued by: <Text weight="medium">{[node.certIssuerOrg, node.certIssuerCn].filter(Boolean).join(" — ")}</Text>
-                      </Text>
-                    ) : null}
-                    {node.certNotBefore || node.certNotAfter ? (
-                      <Text color="neutral-faded" variant="caption-1">
-                        Certificate validity: <Text weight="medium">{formatWindow([node.certNotBefore, node.certNotAfter])}</Text>
-                        {" "}(the certificate's own issued/expiry dates — not when we last scanned it)
-                      </Text>
-                    ) : null}
-                  </View>
-                ) : null}
-                {extraA.length > 0 || extraB.length > 0 ? (
-                  <View gap={1}>
-                    {extraA.length > 0 ? (
-                      <View align="center" direction="row" gap={2} wrap>
-                        <Text color="neutral-faded" variant="caption-1">
-                          Actually via <Text weight="bold">{leftLabel}</Text>
-                        </Text>
-                        {extraA.map((host) => (
-                          <Badge color="neutral" key={host} size="small" variant="faded">
-                            {host}
-                          </Badge>
-                        ))}
-                      </View>
-                    ) : null}
-                    {extraB.length > 0 ? (
-                      <View align="center" direction="row" gap={2} wrap>
-                        <Text color="neutral-faded" variant="caption-1">
-                          Actually via <Text weight="bold">{rightLabel}</Text>
-                        </Text>
-                        {extraB.map((host) => (
-                          <Badge color="neutral" key={host} size="small" variant="faded">
-                            {host}
-                          </Badge>
-                        ))}
-                      </View>
-                    ) : null}
-                  </View>
-                ) : null}
-                <Text color="neutral-faded" variant="caption-1">
-                  {leftLabel || "A"}: {formatWindow(node.windowA)} · {rightLabel || "B"}: {formatWindow(node.windowB)}
-                  {node.sources?.length ? ` · via ${node.sources.join(", ")}` : " · source unknown"}
-                </Text>
-              </View>
-            </Card>
-          </View>
-        );
-      })}
-    </View>
+                </TooltipTrigger>
+                <TooltipContent className="max-w-xs">
+                  Scored below what this kind normally gets for being common and/or stale — see the note below.
+                </TooltipContent>
+              </Tooltip>
+            ) : null}
+            {expired !== null ? (
+              <Badge className={expired ? "text-destructive" : "text-success"} variant="outline">
+                {expired ? "Cert expired" : "Cert valid"}
+              </Badge>
+            ) : null}
+          </div>
+          <div className="flex min-w-0 items-center gap-1.5">
+            <FaviconThumb kind={node.kind} value={node.value} />
+            <CopyValue display={value} value={node.value} />
+          </div>
+        </div>
+        {present(node.contribution) ? (
+          <div className="flex flex-col items-end">
+            <span className="text-base font-semibold tabular-nums">+{formatNumber(node.contribution ?? node.weight)}</span>
+            <span className="text-muted-foreground text-[11px]">points</span>
+          </div>
+        ) : null}
+      </div>
+
+      <dl className="grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-4 lg:grid-cols-6">
+        {present(node.degree) ? (
+          <Metric help="How many entities share this value. Lower is rarer and more telling." label="Shared by" value={node.degree} />
+        ) : null}
+        {present(node.baseWeight) ? (
+          <Metric help="Starting weight for this kind of evidence, before rarity, overlap and recency adjust it." label="Base weight" value={node.baseWeight} />
+        ) : null}
+        {present(node.rarity) ? (
+          <Metric help="Inverse-frequency factor from how widely shared this is — 1.0 is as rare as it gets." label="Rarity" value={node.rarity} />
+        ) : null}
+        {present(node.timeOverlap) ? (
+          <Metric help="Do the two sides' own sighting windows agree with each other?" label="Time overlap" value={node.timeOverlap} />
+        ) : null}
+        {present(node.recency) && node.recency < 1 ? (
+          <Metric help="Staleness factor — how long ago this was last seen at all (lower = older)." label="Recency" value={node.recency} />
+        ) : null}
+        {present(node.rawWeight) ? (
+          <Metric help="Points before related measurements are counted together." label="Before grouping" value={formatNumber(node.rawWeight)} />
+        ) : null}
+      </dl>
+
+      {node.explanation || node.scoringNote || context.length > 0 || node.evidenceGroup ? (
+        <div className="text-muted-foreground flex flex-col gap-1 text-xs">
+          {context.length > 0 ? <span>Network: {context.join(" · ")}</span> : null}
+          {node.evidenceGroup ? <span>Counted with: {formatLabel(node.evidenceGroup)}</span> : null}
+          {node.explanation ? <span>{node.explanation}</span> : null}
+          {node.scoringNote ? <span>{node.scoringNote}</span> : null}
+        </div>
+      ) : null}
+
+      {node.kind === "tls_cert_sha256" && (node.certCn || node.certIssuerCn || node.certIssuerOrg || node.certNotAfter) ? (
+        <dl className="bg-muted/50 grid gap-1 rounded-md p-2 text-xs sm:grid-cols-[auto_1fr] sm:gap-x-3">
+          {node.certCn ? (
+            <>
+              <dt className="text-muted-foreground">Common name</dt>
+              <dd className="font-mono break-all">{node.certCn}</dd>
+            </>
+          ) : null}
+          {node.certIssuerCn || node.certIssuerOrg ? (
+            <>
+              <dt className="text-muted-foreground">Issued by</dt>
+              <dd>{[node.certIssuerOrg, node.certIssuerCn].filter(Boolean).join(" — ")}</dd>
+            </>
+          ) : null}
+          {node.certNotBefore || node.certNotAfter ? (
+            <>
+              <dt className="text-muted-foreground">Valid</dt>
+              <dd>
+                {formatWindow([node.certNotBefore, node.certNotAfter])}{" "}
+                <span className="text-muted-foreground">(the certificate&apos;s own dates, not our scans)</span>
+              </dd>
+            </>
+          ) : null}
+        </dl>
+      ) : null}
+
+      {extraA.length > 0 || extraB.length > 0 ? (
+        <div className="flex flex-col gap-1 text-xs">
+          {[
+            [leftLabel, extraA],
+            [rightLabel, extraB],
+          ]
+            .filter(([, hosts]) => hosts.length > 0)
+            .map(([side, hosts]) => (
+              <div className="flex flex-wrap items-center gap-1" key={side}>
+                <span className="text-muted-foreground">
+                  Seen on <span className="text-foreground font-medium">{side}</span> via
+                </span>
+                {hosts.map((host) => (
+                  <Badge className="font-mono" key={host} variant="outline">
+                    {host}
+                  </Badge>
+                ))}
+              </div>
+            ))}
+        </div>
+      ) : null}
+
+      <p className="text-muted-foreground text-[11px]">
+        {leftLabel || "A"}: {formatWindow(node.windowA)} · {rightLabel || "B"}: {formatWindow(node.windowB)}
+        {node.sources?.length ? ` · via ${node.sources.join(", ")}` : " · source unknown"}
+      </p>
+    </li>
+  );
+}
+
+export const EvidenceList = memo(function EvidenceList({ evidence, leftLabel, rightLabel }) {
+  if (!evidence || evidence.length === 0) {
+    return <p className="text-muted-foreground text-sm">No shared attributing evidence — this connection is unsupported.</p>;
+  }
+  return (
+    <ul className="flex flex-col gap-2">
+      {evidence.map((node) => (
+        <EvidenceItem key={node.id} leftLabel={leftLabel} node={node} rightLabel={rightLabel} />
+      ))}
+    </ul>
   );
 });
 
-// `toggleKey` identifies the *pair*. Defaulting to the right-hand side alone
-// collided: selecting [x, y, z] returns (x,y) (x,z) (y,z), and the last two
-// share b === z — so clicking one expanded both, each showing the other's
-// evidence under the wrong heading. Callers that render a full pair matrix
-// pass an explicit key; the single-anchor lists can keep the old identity.
-export const ConnectionCard = memo(function ConnectionCard({
-  link,
-  expanded,
-  onToggle,
-  toggleKey,
-  leftLabel,
-  rightLabel,
-}) {
-  const strength = linkStrength(link);
-  const topKinds = [...new Set((link.evidence || []).map((node) => sharedNodeLabel(node.kind)))].slice(0, 3);
-  const heading = rightLabel ? `${leftLabel} ↔ ${rightLabel}` : link.target;
-  const key = toggleKey ?? link.b ?? link.target;
+function kindSummary(evidence) {
+  const counts = new Map();
+  (evidence || []).forEach((node) => {
+    const label = sharedNodeLabel(node.kind);
+    counts.set(label, (counts.get(label) || 0) + 1);
+  });
+  return [...counts.entries()];
+}
+
+// One scored connection between two channels: a compact summary row that
+// expands into the evidence behind the score. `showPair` renders "a ↔ b"
+// (comparison lists); otherwise the row names only the other side, since the
+// anchor is the page the analyst is already on.
+export const ConnectionRow = memo(function ConnectionRow({ link, leftLabel, rightLabel, showPair = false, defaultOpen = false }) {
+  const [open, setOpen] = useState(defaultOpen);
+  const kinds = kindSummary(link.evidence);
+  const other = rightLabel || link.target;
 
   return (
-    <Card
-      attributes={{ "aria-expanded": expanded }}
-      onClick={(event) => {
-        // These cards nest inside other clickable cards (a hop chain inside an
-        // expanded connection). Without this the inner toggle also bubbles to
-        // the outer one, collapsing the chain the user just opened.
-        event?.stopPropagation?.();
-        onToggle(key);
-      }}
-      padding={4}
-      selected={expanded}
-    >
-      <View align="center" direction="row" gap={4}>
-        <View align="center" attributes={{ style: { minWidth: 108 } }} gap={1}>
-          <Text variant="title-3" weight="bold">
-            {Math.round(link.score ?? 0)}
-          </Text>
-          <Text color="neutral-faded" variant="caption-1">Match score</Text>
-          <Badge color={strength.color} size="small">
-            {strength.label}
-          </Badge>
-        </View>
-        <View gap={2} grow>
-          <Text weight="semibold">{heading}</Text>
-          <Text color="neutral-faded" variant="body-2">
-            {(link.evidence || []).length} shared evidence item{(link.evidence || []).length === 1 ? "" : "s"}
-          </Text>
-          {topKinds.length > 0 ? (
-            <View direction="row" gap={1} wrap>
-              {topKinds.map((name) => (
-                <Badge color="primary" key={name} size="small" variant="faded">
-                  {name}
-                </Badge>
-              ))}
-            </View>
-          ) : null}
-          <Text color="neutral-faded" variant="caption-1">
-            A higher score means more shared evidence; it is not a probability of common ownership.
-          </Text>
-        </View>
-        <Text attributes={{ "aria-hidden": true }} color="neutral-faded">
-          {expanded ? "▴" : "▾"}
-        </Text>
-      </View>
-      {expanded ? (
-        <View attributes={{ style: { marginTop: 20 } }}>
-          {/* leftLabel/rightLabel are always passed explicitly by every call
-              site -- normalizeGraphLink never sets link.a/link.b, so those
-              were dead fallbacks (see the Reshaped-migration card audit). */}
-          <SharedNodeList evidence={link.evidence} leftLabel={leftLabel || "seed"} rightLabel={rightLabel || link.target} />
-        </View>
-      ) : null}
-    </Card>
+    <Collapsible className="bg-card rounded-lg border" onOpenChange={setOpen} open={open}>
+      <div className="flex items-center gap-3 p-3">
+        <CollapsibleTrigger asChild>
+          <button
+            className="hover:bg-muted/60 -m-1.5 flex min-w-0 flex-1 items-center gap-3 rounded-md p-1.5 text-left"
+            type="button"
+          >
+            <div className="flex w-14 shrink-0 flex-col items-center">
+              <span className="text-xl leading-none font-semibold tabular-nums">{Math.round(link.score ?? 0)}</span>
+              <StrengthLabel link={link} />
+            </div>
+            <div className="flex min-w-0 flex-1 flex-col gap-1">
+              <span className="truncate text-sm font-medium">
+                {showPair ? (
+                  <>
+                    {leftLabel} <span className="text-muted-foreground">↔</span> {other}
+                  </>
+                ) : (
+                  other
+                )}
+              </span>
+              <div className="flex flex-wrap gap-1">
+                {kinds.slice(0, 4).map(([name, count]) => (
+                  <Badge key={name} variant="secondary">
+                    {name}
+                    {count > 1 ? ` ×${count}` : ""}
+                  </Badge>
+                ))}
+                {kinds.length > 4 ? <Badge variant="outline">+{kinds.length - 4} more</Badge> : null}
+                {kinds.length === 0 ? <span className="text-muted-foreground text-xs">No evidence recorded</span> : null}
+              </div>
+            </div>
+            <ChevronDownIcon
+              className={cn("text-muted-foreground size-4 shrink-0 transition-transform", open && "rotate-180")}
+            />
+          </button>
+        </CollapsibleTrigger>
+        {!showPair && other ? (
+          <Button asChild size="sm" variant="ghost">
+            <Link aria-label={`Open ${other}`} to={domainUrl(other)}>
+              Open
+              <ArrowRightIcon data-icon="inline-end" />
+            </Link>
+          </Button>
+        ) : null}
+      </div>
+      <CollapsibleContent>
+        <div className="border-t p-3">
+          <EvidenceList evidence={link.evidence} leftLabel={leftLabel || "A"} rightLabel={other || "B"} />
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
   );
 });

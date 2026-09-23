@@ -1,4 +1,8 @@
+import { AlertCircleIcon } from "lucide-react";
 import { Component } from "react";
+
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
 
 // A render throw anywhere below this point used to unmount the entire tool and
 // leave a blank page with nothing in the UI to say why — an analyst mid-triage
@@ -28,22 +32,27 @@ export default class ErrorBoundary extends Component {
     }
 
     return (
-      <div className="panel section-stack" role="alert">
-        <h2>{this.props.title || "Something went wrong"}</h2>
-        <p className="section-copy">
-          This part of the page failed to render. The data it was given may be in an unexpected
-          shape — reload to try again, and check the browser console for the details.
-        </p>
-        <pre className="error-detail">{String(error?.message || error)}</pre>
-        <div className="action-row">
-          <button className="primary-button" onClick={() => this.setState({ error: null })} type="button">
-            Try again
-          </button>
-          <button className="secondary-button" onClick={() => window.location.reload()} type="button">
-            Reload the page
-          </button>
-        </div>
-      </div>
+      <Alert className="m-4 w-auto" variant="destructive">
+        <AlertCircleIcon />
+        <AlertTitle>{this.props.title || "Something went wrong"}</AlertTitle>
+        <AlertDescription>
+          <p>
+            This part of the page failed to render. The data it was given may be in an unexpected shape — try again,
+            and check the browser console for details.
+          </p>
+          <pre className="bg-muted text-foreground mt-2 max-w-full overflow-x-auto rounded-md p-2 font-mono text-xs">
+            {String(error?.message || error)}
+          </pre>
+          <div className="mt-3 flex gap-2">
+            <Button onClick={() => this.setState({ error: null })} size="sm" variant="outline">
+              Try again
+            </Button>
+            <Button onClick={() => window.location.reload()} size="sm" variant="ghost">
+              Reload the page
+            </Button>
+          </div>
+        </AlertDescription>
+      </Alert>
     );
   }
 }

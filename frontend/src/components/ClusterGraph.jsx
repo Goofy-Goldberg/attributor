@@ -1,5 +1,4 @@
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import { Badge, Button, Checkbox, Slider, Text, TextField, View } from "reshaped";
 import { drag as d3Drag } from "d3-drag";
 import { zoom as d3Zoom, zoomIdentity } from "d3-zoom";
 import { select as d3Select } from "d3-selection";
@@ -12,6 +11,38 @@ import {
   forceX,
   forceY,
 } from "d3-force";
+import {
+  ArrowRightIcon,
+  DownloadIcon,
+  FileCodeIcon,
+  FilterIcon,
+  ImageIcon,
+  MailIcon,
+  MaximizeIcon,
+  SearchIcon,
+  Settings2Icon,
+  XIcon,
+} from "lucide-react";
+import { Link } from "react-router";
+
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
+import { Label } from "@/components/ui/label";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Slider } from "@/components/ui/slider";
+import { Spinner } from "@/components/ui/spinner";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 // Evidence-edge tiers — colour encodes connection STRENGTH only (the score),
 // never the kind of evidence behind it (a strong link can be a cert match, a
@@ -446,9 +477,9 @@ const ClusterGraph = memo(function ClusterGraph({
   otherRoleColor = BRIDGE_COLOR,
   otherRoleLabel = "Bridging subdomain",
   seedRoleLabel = "Channel in this cluster",
-  title = "How this cluster's channels link together",
   description = "Shared infrastructure and registration evidence, with warmer links carrying stronger scores.",
   exportFileName = "network-graph",
+  pinSeeds = false,
 }) {
   const statusId = useId();
   const containerRef = useRef(null);
@@ -613,24 +644,34 @@ const ClusterGraph = memo(function ClusterGraph({
 
   // Evidence edges that survive the knowledge filters. These are the actual
   // relationships between domains; membership ties are handled separately.
+  // With pinSeeds (the comparison view) the channels the analyst picked are
+  // the question being asked, so they and the links between them stay on the
+  // map whatever the strength filters say — hiding a weak link between two
+  // selected channels made the map disagree with the pair list beside it.
+  // The filters still thin out the surrounding context.
+  const pinnedIds = useMemo(
+    () => (pinSeeds ? new Set(allNodes.filter((node) => isSubmitted(node, seedTargets)).map((node) => node.id)) : new Set()),
+    [pinSeeds, allNodes, seedTargets],
+  );
+
   const visibleEvidence = useMemo(() => {
     return allEdges.filter(
       (edge) =>
         edgeKind(edge) === "evidence" &&
         nodeCriteriaIds.has(edge.from) &&
         nodeCriteriaIds.has(edge.to) &&
-        tierFilter[edgeTier(edge)] &&
-        (edge.score || 0) >= minScore &&
+        ((pinnedIds.has(edge.from) && pinnedIds.has(edge.to)) ||
+          (tierFilter[edgeTier(edge)] && (edge.score || 0) >= minScore)) &&
         evidenceTypeFilter[evidenceType(edge)] !== false &&
         edgeMatchesSearch(edge),
     );
-  }, [allEdges, nodeCriteriaIds, tierFilter, minScore, evidenceTypeFilter, edgeMatchesSearch]);
+  }, [allEdges, nodeCriteriaIds, pinnedIds, tierFilter, minScore, evidenceTypeFilter, edgeMatchesSearch]);
 
   // A node earns its place on the map only if it takes part in a surviving
   // link — directly, or (for a submitted domain) through one of its bridges.
   // That's what "submitted domains that match the strength" means in practice.
   const liveIds = useMemo(() => {
-    const ids = new Set();
+    const ids = new Set([...pinnedIds].filter((id) => nodeCriteriaIds.has(id)));
     visibleEvidence.forEach((edge) => {
       ids.add(edge.from);
       ids.add(edge.to);
@@ -641,7 +682,7 @@ const ClusterGraph = memo(function ClusterGraph({
       if (ids.has(edge.to) && nodeCriteriaIds.has(edge.from)) ids.add(edge.from);
     });
     return ids;
-  }, [visibleEvidence, allEdges, nodeCriteriaIds]);
+  }, [visibleEvidence, allEdges, nodeCriteriaIds, pinnedIds]);
 
   const visibleNodes = useMemo(
     () => allNodes.filter((node) => liveIds.has(node.id)),
@@ -866,7 +907,7 @@ const ClusterGraph = memo(function ClusterGraph({
       .attr("fill", (d) => color(d))
       .attr("stroke", (d) => {
         if (selNode === d.id) return SELECTION_RING_COLOR;
-        if (hoverNode === d.id) return "var(--accent, #0a7ea4)";
+        if (hoverNode === d.id) return "var(--primary, #0a7ea4)";
         return "var(--graph-node-ring, #fff)";
       })
       .attr("stroke-width", (d) => (selNode === d.id || hoverNode === d.id ? 3.25 : 1.75));
@@ -1851,277 +1892,251 @@ const ClusterGraph = memo(function ClusterGraph({
               ? `Showing ${displayNodes.length} of ${allNodes.length} domains and ${shownEvidenceCount} of ${totalEvidenceCount} evidence links.`
             : `Showing ${displayNodes.length} domains and ${shownEvidenceCount} evidence links.`;
 
-  return (
-    <section className="cluster-graph-card" ref={containerRef}>
-      <div className="panel-header">
-        <div>
-          <p className="eyebrow">Connection map</p>
-          <h3>{title}</h3>
-          <p className="section-copy">{description}</p>
-        </div>
-      </div>
+  const filterCount = hiddenRoleCount + hiddenTierCount + hiddenEvidenceTypeCount + hiddenStrengthCount + (minScore > 0 ? 1 : 0);
 
-      <div className="graph-controls" aria-label="Knowledge graph controls">
-        <div className="graph-control graph-search-control">
-          <TextField
-            inputAttributes={{ "aria-label": "Search visible domains and evidence", type: "search" }}
-            name="graph-search"
-            onChange={({ value }) => setSearchQuery(value)}
-            placeholder="domain, IP, cert, ASN..."
+  return (
+    <section className="flex min-w-0 flex-col gap-3" ref={containerRef}>
+      {description ? <p className="text-muted-foreground text-sm">{description}</p> : null}
+
+      <div aria-label="Graph controls" className="flex flex-wrap items-center gap-2" role="toolbar">
+        <InputGroup className="w-full sm:w-64">
+          <InputGroupAddon>
+            <SearchIcon />
+          </InputGroupAddon>
+          <InputGroupInput
+            aria-label="Search visible domains and evidence"
+            onChange={(event) => setSearchQuery(event.target.value)}
+            placeholder="Find domain, IP, cert, ASN…"
+            type="search"
             value={searchQuery}
           />
-        </div>
+        </InputGroup>
 
-        <label className="graph-control compact">
-          <span>Labels</span>
-          <select
-            aria-label="Node label density"
-            title="Node label density"
-            value={labelMode}
-            onChange={(e) => setLabelMode(e.target.value)}
-          >
-            {Object.entries(LABEL_MODES).map(([key, mode]) => (
-              <option key={key} value={key}>
-                {mode.label}
-              </option>
-            ))}
-          </select>
-        </label>
+        <Popover>
+          <PopoverTrigger asChild>
+            <Button variant="outline">
+              <FilterIcon data-icon="inline-start" />
+              Filters
+              {filterCount > 0 ? (
+                <Badge className="ml-1 h-5 min-w-5 rounded-full px-1 tabular-nums" variant="secondary">
+                  {filterCount}
+                </Badge>
+              ) : null}
+            </Button>
+          </PopoverTrigger>
+          <PopoverContent align="start" className="w-80">
+            <div className="flex flex-col gap-4">
+              <GraphCheckGroup legend="Show">
+                {Object.entries(ROLE_FILTERS).map(([role, label]) => (
+                  <GraphCheck
+                    checked={roleFilter[role]}
+                    key={role}
+                    label={label}
+                    onChange={(checked) => setRoleFilter((prev) => ({ ...prev, [role]: checked }))}
+                    swatch={{ background: role === "submitted" ? SUBMITTED_COLOR : otherRoleColor, round: true }}
+                  />
+                ))}
+              </GraphCheckGroup>
 
-        <div className="graph-control compact">
-          <Text variant="caption-1">Spread</Text>
-          <Slider
-            max={2}
-            min={0.5}
-            name="graph-spread"
-            onChange={({ value }) => setSpread(value)}
-            step={0.1}
-            value={spread}
-          />
-        </div>
+              <GraphCheckGroup legend="Link strength">
+                {TIER_ORDER.map((tier) => (
+                  <GraphCheck
+                    checked={tierFilter[tier]}
+                    key={tier}
+                    label={EDGE_TIERS[tier].label}
+                    onChange={(checked) => setTierFilter((prev) => ({ ...prev, [tier]: checked }))}
+                    swatch={{ background: EDGE_TIERS[tier].color }}
+                  />
+                ))}
+              </GraphCheckGroup>
 
-        {maxScore > 0 ? (
-          <div className="graph-control compact">
-            <Text variant="caption-1">Min. strength {minScore > 0 ? `(${minScore})` : ""}</Text>
-            <Slider
-              max={maxScore}
-              min={0}
-              name="graph-min-score"
-              onChange={({ value }) => setMinScore(value)}
-              step={1}
-              value={minScore}
-            />
-          </div>
-        ) : null}
+              {maxScore > 0 ? (
+                <div className="flex flex-col gap-2">
+                  <div className="flex items-center justify-between text-sm font-medium">
+                    <span>Minimum score</span>
+                    <span className="text-muted-foreground tabular-nums">{minScore}</span>
+                  </div>
+                  <Slider
+                    aria-label="Minimum link score"
+                    max={maxScore}
+                    min={0}
+                    onValueChange={([value]) => setMinScore(value)}
+                    step={1}
+                    value={[minScore]}
+                  />
+                </div>
+              ) : null}
 
-        <div className="graph-control graph-filter-block">
-          <span>Objects</span>
-          <div className="graph-tier-toggles">
-            {Object.entries(ROLE_FILTERS).map(([role, label]) => (
-              <Checkbox
-                checked={roleFilter[role]}
-                inputAttributes={{ "aria-label": `Show ${label.toLowerCase()} objects` }}
-                key={role}
-                onChange={({ checked }) => setRoleFilter((prev) => ({ ...prev, [role]: checked }))}
-                size="small"
-              >
-                <span
-                  className="graph-legend-swatch round"
-                  style={{ background: role === "submitted" ? SUBMITTED_COLOR : otherRoleColor }}
-                />
-                {label}
-              </Checkbox>
-            ))}
-          </div>
-        </div>
+              {filterTierKeys.length > 0 || hasUnclassifiedTier ? (
+                <GraphCheckGroup legend="OpenCTI tier">
+                  {filterTierKeys.map((tier) => (
+                    <GraphCheck
+                      checked={domainTierFilter[String(tier)]}
+                      key={tier}
+                      label={DOMAIN_TIER_LABELS[tier]}
+                      onChange={(checked) => setDomainTierFilter((prev) => ({ ...prev, [String(tier)]: checked }))}
+                      swatch={{ background: DOMAIN_TIER_COLORS[tier], round: true }}
+                    />
+                  ))}
+                  {hasUnclassifiedTier ? (
+                    <GraphCheck
+                      checked={domainTierFilter[UNCLASSIFIED_TIER]}
+                      label="Unclassified"
+                      onChange={(checked) => setDomainTierFilter((prev) => ({ ...prev, [UNCLASSIFIED_TIER]: checked }))}
+                    />
+                  ) : null}
+                </GraphCheckGroup>
+              ) : null}
 
-        {(filterTierKeys.length > 0 || hasUnclassifiedTier) ? (
-          <div className="graph-control graph-filter-block">
-            <span>OpenCTI tier</span>
-            <div className="graph-tier-toggles">
-              {filterTierKeys.map((tier) => (
-                <Checkbox
-                  checked={domainTierFilter[String(tier)]}
-                  inputAttributes={{ "aria-label": `Show ${DOMAIN_TIER_LABELS[tier]} domains` }}
-                  key={`filter-tier-${tier}`}
-                  onChange={({ checked }) => setDomainTierFilter((prev) => ({ ...prev, [String(tier)]: checked }))}
-                  size="small"
-                >
-                  <span className="graph-legend-swatch round" style={{ background: DOMAIN_TIER_COLORS[tier] }} />
-                  {DOMAIN_TIER_LABELS[tier].replace("Tier ", "T")}
-                </Checkbox>
-              ))}
-              {hasUnclassifiedTier ? (
-                <Checkbox
-                  checked={domainTierFilter[UNCLASSIFIED_TIER]}
-                  inputAttributes={{ "aria-label": "Show unclassified domains" }}
-                  onChange={({ checked }) => setDomainTierFilter((prev) => ({ ...prev, [UNCLASSIFIED_TIER]: checked }))}
-                  size="small"
-                >
-                  <span className="graph-legend-swatch round muted-swatch" />
-                  Unclassified
-                </Checkbox>
+              {evidenceTypes.length > 0 ? (
+                <GraphCheckGroup legend="Relationship type">
+                  <div className="flex max-h-40 flex-col gap-2 overflow-y-auto pr-1">
+                    {evidenceTypes.map((type) => (
+                      <GraphCheck
+                        checked={evidenceTypeFilter[type] !== false}
+                        key={type}
+                        label={type}
+                        onChange={(checked) => setEvidenceTypeFilter((prev) => ({ ...prev, [type]: checked }))}
+                      />
+                    ))}
+                  </div>
+                </GraphCheckGroup>
+              ) : null}
+
+              {activeCriteriaCount > 0 ? (
+                <Button onClick={resetKnowledgeFilters} size="sm" variant="outline">
+                  Reset all filters
+                </Button>
               ) : null}
             </div>
-          </div>
-        ) : null}
+          </PopoverContent>
+        </Popover>
 
-        {evidenceTypes.length > 0 ? (
-          <div className="graph-control graph-filter-block wide">
-            <span>Relationship type</span>
-            <div className="graph-tier-toggles scrollable">
-              {evidenceTypes.map((type) => (
-                <Checkbox
-                  checked={evidenceTypeFilter[type] !== false}
-                  inputAttributes={{ "aria-label": `Show ${type} relationships` }}
-                  key={type}
-                  onChange={({ checked }) => setEvidenceTypeFilter((prev) => ({ ...prev, [type]: checked }))}
-                  size="small"
+        <Popover>
+          <PopoverTrigger asChild>
+            <Button variant="outline">
+              <Settings2Icon data-icon="inline-start" />
+              View
+            </Button>
+          </PopoverTrigger>
+          <PopoverContent align="start" className="w-72">
+            <div className="flex flex-col gap-4">
+              <div className="flex flex-col gap-2">
+                <span className="text-sm font-medium">Labels</span>
+                <ToggleGroup
+                  aria-label="Node label density"
+                  className="w-full"
+                  onValueChange={(value) => value && setLabelMode(value)}
+                  size="sm"
+                  type="single"
+                  value={labelMode}
+                  variant="outline"
                 >
-                  <span title={type}>{truncateLabel(type, 18)}</span>
-                </Checkbox>
-              ))}
+                  {Object.entries(LABEL_MODES).map(([key, mode]) => (
+                    <ToggleGroupItem className="flex-1" key={key} value={key}>
+                      {mode.label}
+                    </ToggleGroupItem>
+                  ))}
+                </ToggleGroup>
+              </div>
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center justify-between text-sm font-medium">
+                  <span>Spread</span>
+                  <span className="text-muted-foreground tabular-nums">{spread.toFixed(1)}×</span>
+                </div>
+                <Slider
+                  aria-label="Graph spread"
+                  max={2}
+                  min={0.5}
+                  onValueChange={([value]) => setSpread(value)}
+                  step={0.1}
+                  value={[spread]}
+                />
+              </div>
             </div>
-          </div>
-        ) : null}
+          </PopoverContent>
+        </Popover>
 
-        <div className="graph-control graph-filter-block">
-          <span>Strength</span>
-          <div className="graph-tier-toggles">
-            {TIER_ORDER.map((tier) => (
-              <Checkbox
-                checked={tierFilter[tier]}
-                inputAttributes={{ "aria-label": `Show ${tier} links` }}
-                key={tier}
-                onChange={({ checked }) => setTierFilter((prev) => ({ ...prev, [tier]: checked }))}
-                size="small"
-              >
-                <span className="graph-legend-swatch" style={{ background: EDGE_TIERS[tier].color }} />
-                {tier}
-              </Checkbox>
-            ))}
-          </div>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button aria-label="Fit the whole graph" onClick={resetView} size="icon" variant="ghost">
+              <MaximizeIcon />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Fit the whole graph</TooltipContent>
+        </Tooltip>
+
+        <div className="ml-auto flex items-center gap-2">
+          {emailState.status === "sent" || emailState.status === "error" ? (
+            <span className={emailState.status === "error" ? "text-destructive text-xs" : "text-muted-foreground text-xs"}>
+              {emailState.message}
+            </span>
+          ) : null}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button disabled={emailState.status === "sending"} variant="outline">
+                {emailState.status === "sending" ? <Spinner data-icon="inline-start" /> : <DownloadIcon data-icon="inline-start" />}
+                {emailState.status === "sending" ? "Sending…" : "Export map"}
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-60">
+              <DropdownMenuGroup>
+                <DropdownMenuItem onSelect={downloadImage}>
+                  <ImageIcon />
+                  PNG image
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={downloadInteractive}>
+                  <FileCodeIcon />
+                  Interactive HTML (offline)
+                </DropdownMenuItem>
+              </DropdownMenuGroup>
+              <DropdownMenuSeparator />
+              <DropdownMenuGroup>
+                <DropdownMenuItem onSelect={emailGraph}>
+                  <MailIcon />
+                  Email to configured recipients
+                </DropdownMenuItem>
+              </DropdownMenuGroup>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
-
-        {activeCriteriaCount > 0 ? (
-          <Button onClick={resetKnowledgeFilters} size="small" title="Reset all graph filters" variant="outline">
-            Reset filters
-          </Button>
-        ) : null}
-
-        {hasSelection ? (
-          <Button
-            attributes={{ "aria-label": focusViewActive ? "Keep the selected neighborhood in context" : "Focus the graph on the selected neighborhood" }}
-            onClick={() => setNarrowSelection((current) => !current)}
-            size="small"
-            title={focusViewActive ? "Keep the selected neighborhood in context" : "Focus the graph on the selected neighborhood"}
-            variant="outline"
-          >
-            {focusViewActive ? "Keep context" : "Focus selection"}
-          </Button>
-        ) : null}
-
-        {hasSelection ? (
-          <Button
-            attributes={{ "aria-label": "Fit the selected neighborhood" }}
-            onClick={fitSelection}
-            size="small"
-            title="Fit the selected neighborhood"
-            variant="outline"
-          >
-            Fit selection
-          </Button>
-        ) : null}
-
-        {hasSelection ? (
-          <Button onClick={clearFocus} size="small" title="Clear graph selection" variant="outline">
-            Clear selection
-          </Button>
-        ) : null}
-
-        <Button
-          attributes={{ "aria-label": "Fit the whole graph" }}
-          onClick={resetView}
-          size="small"
-          title="Fit the whole graph"
-          variant="outline"
-        >
-          Fit graph
-        </Button>
-
-        <View attributes={{ "aria-label": "Graph export actions" }} direction="row" gap={2}>
-          <Button onClick={downloadImage} size="small" title="Download PNG image" variant="outline">
-            PNG
-          </Button>
-
-          <Button onClick={downloadInteractive} size="small" title="Download offline interactive HTML report" variant="outline">
-            HTML report
-          </Button>
-
-          <Button
-            color="primary"
-            disabled={emailState.status === "sending"}
-            loading={emailState.status === "sending"}
-            onClick={emailGraph}
-            size="small"
-            title="Email the graph attachments"
-          >
-            {emailState.status === "sending" ? "Sending..." : "Email"}
-          </Button>
-        </View>
       </div>
 
-      <p className="graph-status" id={statusId} aria-live="polite">
-        <span>{graphStatus}</span>
-        {denseMap && labelMode === "auto" && displayNodes.length > 0 ? (
-          <span>Dense map: labels are limited to anchors and hubs.</span>
-        ) : null}
-      </p>
-
-      {emailState.status === "sent" || emailState.status === "error" ? (
-        <p
-          className={emailState.status === "error" ? undefined : "muted"}
-          style={emailState.status === "error" ? { color: "var(--danger)" } : undefined}
-        >
-          {emailState.message}
-        </p>
-      ) : null}
-
-      <div className="graph-legend" aria-label="Map legend">
-        <span className="graph-legend-item">
-          <span className="graph-legend-swatch round" style={{ background: SUBMITTED_COLOR }} />
-          {seedRoleLabel} ({submittedCount})
+      <div className="text-muted-foreground flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+        <span aria-live="polite" id={statusId}>
+          {graphStatus}
+          {denseMap && labelMode === "auto" && displayNodes.length > 0 ? " Dense map: labels are limited to anchors and hubs." : ""}
         </span>
+      </div>
+
+      <div aria-label="Map legend" className="text-muted-foreground flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+        <LegendItem swatch={{ background: SUBMITTED_COLOR, round: true }}>
+          {seedRoleLabel} ({submittedCount})
+        </LegendItem>
         {bridgeCount > 0 ? (
-          <span className="graph-legend-item">
-            <span className="graph-legend-swatch round" style={{ background: otherRoleColor }} />
+          <LegendItem swatch={{ background: otherRoleColor, round: true }}>
             {otherRoleLabel} ({bridgeCount})
-          </span>
+          </LegendItem>
         ) : null}
         {TIER_ORDER.map((tier) => (
-          <span className="graph-legend-item" key={tier}>
-            <span className="graph-legend-swatch" style={{ background: EDGE_TIERS[tier].color }} />
+          <LegendItem key={tier} swatch={{ background: EDGE_TIERS[tier].color }}>
             {EDGE_TIERS[tier].label}
-          </span>
+          </LegendItem>
         ))}
         {hasInferredEdges ? (
-          <span className="graph-legend-item" title="Solid = direct scored evidence. Dashed = a multi-hop chain, no direct evidence between this pair.">
-            <span className="graph-legend-swatch graph-legend-dashed" />
-            Dashed = multi-hop chain
-          </span>
+          <LegendItem swatch={{ dashed: true }} title="Solid = direct scored evidence. Dashed = a multi-hop chain, no direct evidence between this pair.">
+            Multi-hop chain
+          </LegendItem>
         ) : null}
-        {presentTiers.length > 0
-          ? presentTiers.map((tier) => (
-              <span className="graph-legend-item" key={`domain-tier-${tier}`}>
-                <span className="graph-legend-swatch round" style={{ background: DOMAIN_TIER_COLORS[tier] }} />
-                {DOMAIN_TIER_LABELS[tier]}
-              </span>
-            ))
-          : null}
+        {presentTiers.map((tier) => (
+          <LegendItem key={`domain-tier-${tier}`} swatch={{ background: DOMAIN_TIER_COLORS[tier], round: true }}>
+            {DOMAIN_TIER_LABELS[tier]}
+          </LegendItem>
+        ))}
       </div>
 
-      <div className="graph-workbench">
-        <div className="graph-stage">
+      <div className="grid min-w-0 gap-3 lg:grid-cols-[minmax(0,1fr)_18rem]">
+        <div className="relative overflow-hidden rounded-lg border" style={{ background: "var(--graph-bg)" }}>
           {/* role is "group", not "img": the nodes below are role="button"
               tabindex="0" with keydown handlers, and the edge hit-lines are
               focusable too. role="img" collapses the whole subtree into one
@@ -2130,102 +2145,101 @@ const ClusterGraph = memo(function ClusterGraph({
               worst of both. "group" keeps the label and description while
               leaving the children exposed. */}
           <svg
-            ref={svgRef}
-            className="cluster-graph"
-            viewBox={`0 0 ${width} ${height}`}
-            style={{ cursor: "grab", height }}
-            role="group"
-            aria-label="Network map of connected domains"
             aria-describedby={statusId}
+            aria-label="Network map of connected domains"
+            className="block w-full"
+            ref={svgRef}
+            role="group"
+            style={{ cursor: "grab", height, minHeight: 460 }}
+            viewBox={`0 0 ${width} ${height}`}
           >
             <g ref={gRef} />
           </svg>
           {displayNodes.length === 0 ? (
-            <div className="graph-empty-state" role="status">
-              <strong>No visible links</strong>
-              <span>Relax the knowledge filters to bring relationships back into view.</span>
+            <div
+              className="bg-popover text-popover-foreground pointer-events-none absolute top-1/2 left-1/2 flex w-[min(20rem,calc(100%-2rem))] -translate-x-1/2 -translate-y-1/2 flex-col gap-1 rounded-lg border p-4 text-center shadow-sm"
+              role="status"
+            >
+              <strong className="text-sm">No visible links</strong>
+              <span className="text-muted-foreground text-xs">Relax the filters to bring relationships back into view.</span>
             </div>
           ) : null}
         </div>
 
-        <aside className="graph-inspector" aria-label="Knowledge selection details">
-          {selectedEdgeData ? (
+        <aside aria-label="Selection details" className="bg-card flex min-w-0 flex-col gap-3 rounded-lg border p-4 text-sm">
+          {selectedEdgeData || selectedNodeData ? (
             <>
-              <div className="graph-inspector-head">
-                <div>
-                  <span className="muted">Selected link</span>
-                  <strong>{evidenceType(selectedEdgeData)}</strong>
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex min-w-0 flex-col">
+                  <span className="text-muted-foreground text-xs">{selectedEdgeData ? "Selected link" : "Selected channel"}</span>
+                  <strong className="break-words">
+                    {selectedEdgeData ? evidenceType(selectedEdgeData) : selectedNodeData.label || selectedNode}
+                  </strong>
                 </div>
-                <Button onClick={clearFocus} size="small" variant="outline">
-                  Clear
+                <Button aria-label="Clear selection" onClick={clearFocus} size="icon-sm" variant="ghost">
+                  <XIcon />
                 </Button>
               </div>
-              <p className="card-copy graph-selection-summary">
-                <strong>{selectedEdgeData.from}</strong> to <strong>{selectedEdgeData.to}</strong>
-              </p>
-              <dl className="graph-inspector-meta">
-                <div>
-                  <dt>Source</dt>
-                  <dd>{selectedEdgeData.from}</dd>
-                </div>
-                <div>
-                  <dt>Target</dt>
-                  <dd>{selectedEdgeData.to}</dd>
-                </div>
-                <div>
-                  <dt>Strength</dt>
-                  <dd>{EDGE_TIERS[edgeTier(selectedEdgeData)].label}</dd>
-                </div>
-                <div>
-                  <dt>Score</dt>
-                  <dd>{selectedEdgeData.score ?? "-"}</dd>
-                </div>
-              </dl>
-              <p className="card-copy">Evidence:</p>
-              {renderPairEvidence && selectedEdgeData.pairing_id ? (
-                renderPairEvidence(selectedEdgeData.pairing_id)
-              ) : (
-                <ul className="simple-list">
-                  {evidenceLabels(selectedEdgeData).map((label) => (
-                    <li key={label}>{label}</li>
-                  ))}
-                </ul>
-              )}
-            </>
-          ) : selectedNodeData ? (
-            <>
-              <div className="graph-inspector-head">
-                <div>
-                  <span className="muted">Selected domain</span>
-                  <strong>{selectedNodeData.label || selectedNode}</strong>
-                </div>
-                <Button onClick={clearFocus} size="small" variant="outline">
-                  Clear
+              <div className="flex flex-wrap gap-1">
+                <Button onClick={() => setNarrowSelection((current) => !current)} size="xs" variant="outline">
+                  {focusViewActive ? "Show context" : "Focus"}
+                </Button>
+                <Button onClick={fitSelection} size="xs" variant="outline">
+                  Zoom to fit
                 </Button>
               </div>
-              <p className="card-copy graph-selection-summary">
-                <strong>{selectedNodeData.label || selectedNode}</strong>
-              </p>
-              <dl className="graph-inspector-meta">
-                <div>
-                  <dt>Type</dt>
-                  <dd>{nodeRole(selectedNodeData, seedTargets) === "submitted" ? "Anchor channel" : "Related channel"}</dd>
-                </div>
-                <div>
-                  <dt>Tier</dt>
-                  <dd>{selectedNodeData.tier ? DOMAIN_TIER_LABELS[selectedNodeData.tier] : "Unclassified"}</dd>
-                </div>
-                <div>
-                  <dt>Relationships</dt>
-                  <dd>{selectedNodeEdges.length}</dd>
-                </div>
+              <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
+                {selectedEdgeData ? (
+                  <>
+                    <dt className="text-muted-foreground">From</dt>
+                    <dd className="break-all">{selectedEdgeData.from}</dd>
+                    <dt className="text-muted-foreground">To</dt>
+                    <dd className="break-all">{selectedEdgeData.to}</dd>
+                    <dt className="text-muted-foreground">Strength</dt>
+                    <dd>{EDGE_TIERS[edgeTier(selectedEdgeData)].label}</dd>
+                    <dt className="text-muted-foreground">Score</dt>
+                    <dd className="tabular-nums">{selectedEdgeData.score ?? "—"}</dd>
+                  </>
+                ) : (
+                  <>
+                    <dt className="text-muted-foreground">Role</dt>
+                    <dd>{nodeRole(selectedNodeData, seedTargets) === "submitted" ? "Selected channel" : "Related channel"}</dd>
+                    <dt className="text-muted-foreground">Tier</dt>
+                    <dd>{selectedNodeData.tier ? DOMAIN_TIER_LABELS[selectedNodeData.tier] : "Unclassified"}</dd>
+                    <dt className="text-muted-foreground">Links</dt>
+                    <dd className="tabular-nums">{selectedNodeEdges.length}</dd>
+                  </>
+                )}
               </dl>
+              {selectedEdgeData ? (
+                <div className="flex flex-col gap-1">
+                  <span className="text-muted-foreground text-xs">Evidence</span>
+                  {renderPairEvidence && selectedEdgeData.pairing_id ? (
+                    renderPairEvidence(selectedEdgeData.pairing_id)
+                  ) : (
+                    <ul className="flex list-disc flex-col gap-0.5 pl-4 text-xs">
+                      {evidenceLabels(selectedEdgeData).map((label) => (
+                        <li className="break-words" key={label}>
+                          {label}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              ) : null}
+              {selectedNodeData ? (
+                <Button asChild size="sm" variant="secondary">
+                  <Link to={`/domain/${encodeURIComponent(selectedNodeData.label || selectedNode)}`}>
+                    Open channel
+                    <ArrowRightIcon data-icon="inline-end" />
+                  </Link>
+                </Button>
+              ) : null}
             </>
           ) : (
-            <div className="graph-inspector-empty">
-              <span className="muted">Inspector</span>
-              <strong>Select a node or relationship</strong>
-              <p className="card-copy">Details, evidence, score, and tier appear here.</p>
+            <div className="text-muted-foreground flex flex-col gap-1">
+              <strong className="text-foreground">Nothing selected</strong>
+              <span className="text-xs">Click a channel or a link to see its details. Drag to move, scroll to zoom.</span>
             </div>
           )}
         </aside>
@@ -2233,6 +2247,56 @@ const ClusterGraph = memo(function ClusterGraph({
     </section>
   );
 });
+
+function Swatch({ background, round = false, dashed = false }) {
+  if (dashed) {
+    return (
+      <span
+        aria-hidden
+        className="inline-block h-0.5 w-4 shrink-0"
+        style={{ background: "repeating-linear-gradient(90deg, #94a3b8 0 4px, transparent 4px 7px)" }}
+      />
+    );
+  }
+  return (
+    <span
+      aria-hidden
+      className={round ? "inline-block size-2.5 shrink-0 rounded-full" : "inline-block h-1 w-4 shrink-0 rounded-full"}
+      style={{ background: background || "#94a3b8" }}
+    />
+  );
+}
+
+function LegendItem({ swatch, title, children }) {
+  return (
+    <span className="inline-flex items-center gap-1.5" title={title}>
+      <Swatch {...swatch} />
+      {children}
+    </span>
+  );
+}
+
+function GraphCheckGroup({ legend, children }) {
+  return (
+    <fieldset className="flex flex-col gap-2">
+      <legend className="mb-2 text-sm font-medium">{legend}</legend>
+      {children}
+    </fieldset>
+  );
+}
+
+function GraphCheck({ checked, onChange, label, swatch }) {
+  const id = useId();
+  return (
+    <div className="flex items-center gap-2">
+      <Checkbox checked={checked} id={id} onCheckedChange={(value) => onChange(value === true)} />
+      <Label className="min-w-0 flex-1 font-normal" htmlFor={id}>
+        {swatch ? <Swatch {...swatch} /> : null}
+        <span className="truncate">{label}</span>
+      </Label>
+    </div>
+  );
+}
 
 // Leaf-derived wording reads badly for these two ("Shared crypto wallet
 // values"), so they get spelled out rather than falling through below.

@@ -310,11 +310,7 @@ function parseTextPayload(text) {
 }
 
 // The one-shot fetch used by everything outside useApi (cluster graph loads,
-// the connections scoring POST, ingest submission). There used to be two of
-// these — this one, unused, and `finishIngest` in features/ingest.jsx, which
-// the pages imported instead. Pages taking their generic response parser from
-// a module named "ingest" was the wrong shape, so the behaviour lives here and
-// features/ingest.jsx re-exports it.
+// the connections scoring POST, ingest submission).
 export async function fetchJson(path, init = {}) {
   const { timeoutMs = REQUEST_TIMEOUT_MS, signal: callerSignal, ...rest } = init;
   const request = requestSignal(timeoutMs);

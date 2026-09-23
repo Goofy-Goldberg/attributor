@@ -38,7 +38,7 @@ function describeLink(link, leftLabel, rightLabel) {
   const strength = linkStrength(link);
   const kinds = [...new Set((link.evidence || []).map((node) => sharedNodeLabel(node.kind)))];
   const evidenceText = kinds.length > 0 ? ` via ${kinds.join(", ")}` : "";
-  return `${leftLabel} and ${rightLabel} share evidence (${strength.label.toLowerCase()}, match score ${Math.round(link.score ?? 0)})${evidenceText}.`;
+  return `${leftLabel} and ${rightLabel} share evidence (${strength.label.toLowerCase()} evidence, match score ${Math.round(link.score ?? 0)})${evidenceText}.`;
 }
 
 // Each score describes one pairwise match in the chain, not the endpoints.
@@ -47,7 +47,7 @@ function describeChainLines(chain) {
     const strength = linkStrength(hop);
     const kinds = [...new Set((hop.evidence || []).map((node) => sharedNodeLabel(node.kind)))];
     const evidenceText = kinds.length > 0 ? ` via ${kinds.join(", ")}` : "";
-    return `${hop.from} → ${hop.to}${evidenceText} (${strength.label.toLowerCase()}, match score ${Math.round(hop.score ?? 0)})`;
+    return `${hop.from} → ${hop.to}${evidenceText} (${strength.label.toLowerCase()} evidence, match score ${Math.round(hop.score ?? 0)})`;
   });
 }
 

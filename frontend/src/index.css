@@ -1,0 +1,208 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-heading: var(--font-sans);
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, SFMono-Regular, monospace;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  /* App-specific semantic tokens: evidence strength and OpenCTI tier. These
+     are data colours, kept apart from the UI accent so "teal/champagne" never
+     also means "strong evidence". */
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-strength-strong: var(--strength-strong);
+  --color-strength-moderate: var(--strength-moderate);
+  --color-strength-weak: var(--strength-weak);
+  --color-tier-1: var(--tier-1);
+  --color-tier-2: var(--tier-2);
+  --color-tier-3: var(--tier-3);
+  --color-tier-4: var(--tier-4);
+  --color-tier-5: var(--tier-5);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/* Light — cool paper and ink, teal accent. */
+:root {
+  --background: #f5f7f9;
+  --foreground: #0e161d;
+  --card: #ffffff;
+  --card-foreground: #0e161d;
+  --popover: #ffffff;
+  --popover-foreground: #0e161d;
+  --primary: #0a7ea4;
+  --primary-foreground: #ffffff;
+  --secondary: #e9edf0;
+  --secondary-foreground: #0e161d;
+  --muted: #eef1f4;
+  --muted-foreground: #57646f;
+  --accent: #e6ecf0;
+  --accent-foreground: #0e161d;
+  --destructive: #ba4a3d;
+  --success: #1c8a5d;
+  --warning: #b6751e;
+  --border: rgba(15, 26, 36, 0.12);
+  --input: rgba(15, 26, 36, 0.16);
+  --ring: #0a7ea4;
+  --chart-1: #0a7ea4;
+  --chart-2: #1c8a5d;
+  --chart-3: #b6751e;
+  --chart-4: #ba4a3d;
+  --chart-5: #57646f;
+  --radius: 0.5rem;
+  --sidebar: #eef1f4;
+  --sidebar-foreground: #0e161d;
+  --sidebar-primary: #0a7ea4;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #e1e7ec;
+  --sidebar-accent-foreground: #0e161d;
+  --sidebar-border: rgba(15, 26, 36, 0.1);
+  --sidebar-ring: #0a7ea4;
+
+  --strength-strong: #dc2626;
+  --strength-moderate: #f97316;
+  --strength-weak: #94a3b8;
+  --tier-1: #b91c1c;
+  --tier-2: #ea580c;
+  --tier-3: #ca8a04;
+  --tier-4: #2563eb;
+  --tier-5: #64748b;
+
+  /* Read by ClusterGraph's d3 renderer. */
+  --graph-bg: #f7f8fa;
+  --graph-node-ring: #ffffff;
+  --graph-node-icon: rgba(255, 255, 255, 0.88);
+  --graph-label: #2f3a45;
+  --graph-label-halo: rgba(247, 248, 250, 0.94);
+  --graph-edge-label: #4b5563;
+  --graph-edge-label-bg: rgba(247, 248, 250, 0.92);
+}
+
+/* Dark — midnight blue and champagne. */
+.dark {
+  --background: #0b1229;
+  --foreground: #f3e9d2;
+  --card: #10152b;
+  --card-foreground: #f3e9d2;
+  --popover: #141b36;
+  --popover-foreground: #f3e9d2;
+  --primary: #d9c298;
+  --primary-foreground: #10152b;
+  --secondary: #182047;
+  --secondary-foreground: #f3e9d2;
+  --muted: #141b36;
+  --muted-foreground: #b8a788;
+  --accent: #1c2650;
+  --accent-foreground: #f3e9d2;
+  --destructive: #f07167;
+  --success: #5cc592;
+  --warning: #e8b04b;
+  --border: rgba(216, 194, 152, 0.14);
+  --input: rgba(216, 194, 152, 0.2);
+  --ring: #c9a86a;
+  --chart-1: #d9c298;
+  --chart-2: #5cc592;
+  --chart-3: #e8b04b;
+  --chart-4: #f07167;
+  --chart-5: #b8a788;
+  --sidebar: #0d1530;
+  --sidebar-foreground: #f3e9d2;
+  --sidebar-primary: #d9c298;
+  --sidebar-primary-foreground: #10152b;
+  --sidebar-accent: #182047;
+  --sidebar-accent-foreground: #f3e9d2;
+  --sidebar-border: rgba(216, 194, 152, 0.12);
+  --sidebar-ring: #c9a86a;
+
+  --graph-bg: #0a0f22;
+  --graph-node-ring: rgba(10, 15, 34, 0.9);
+  --graph-node-icon: rgba(255, 255, 255, 0.86);
+  --graph-label: #f3e9d2;
+  --graph-label-halo: rgba(10, 15, 34, 0.88);
+  --graph-edge-label: #ead9b8;
+  --graph-edge-label-bg: rgba(10, 15, 34, 0.94);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+  html {
+    @apply font-sans;
+  }
+}
+
+/* ClusterGraph's SVG is drawn imperatively by d3, so its elements are styled
+   by class here rather than with utilities. */
+@layer components {
+  .graph-node-label {
+    fill: var(--graph-label);
+    font-size: 0.76rem;
+    user-select: none;
+  }
+  .graph-node-label.ip {
+    font-size: 0.66rem;
+    opacity: 0.75;
+  }
+  .graph-edge-label-text {
+    fill: var(--graph-edge-label);
+    font-size: 0.62rem;
+    letter-spacing: 0.01em;
+    user-select: none;
+  }
+  .graph-edge-label-bg {
+    fill: var(--graph-edge-label-bg);
+    opacity: 0.94;
+  }
+  .graph-edge-hit {
+    cursor: pointer;
+  }
+  .cluster-node:focus-visible,
+  .graph-edge-hit:focus-visible {
+    outline: none;
+  }
+}

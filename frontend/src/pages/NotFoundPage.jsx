@@ -1,23 +1,15 @@
-import { Link } from "../router.jsx";
-import AppShell from "../shell/AppShell.jsx";
+import { CompassIcon } from "lucide-react";
+import { Link } from "react-router";
+
+import { EmptyState } from "@/components/page.jsx";
+import { Button } from "@/components/ui/button";
 
 export default function NotFoundPage() {
   return (
-    <AppShell>
-      <section className="panel section-stack">
-        <div className="panel-header">
-          <div>
-            <p className="eyebrow">404</p>
-            <h1>Page not found</h1>
-          </div>
-        </div>
-        <p className="section-copy">This page does not exist.</p>
-        <div className="action-row">
-          <Link className="primary-button" to="/">
-            Back to the pool
-          </Link>
-        </div>
-      </section>
-    </AppShell>
+    <EmptyState className="mt-12" description="This page does not exist." icon={CompassIcon} title="Page not found">
+      <Button asChild>
+        <Link to="/">Back to channels</Link>
+      </Button>
+    </EmptyState>
   );
 }

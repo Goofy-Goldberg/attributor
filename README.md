@@ -41,7 +41,7 @@ React + FastAPI application for domain and IP OSINT, origin discovery, and infra
 | `utils/censys_enrichment.py` | Censys host-enrichment client — 0 credits but capped at 20k calls/day, so it gap-fills ASN/network fields and contributes only what nothing else has (reputation, GreyNoise, VPN/proxy/hosting flags, abuse contacts) |
 | `integrations/mattermost_alerts.py` | Optional Mattermost webhook notifications |
 | `integrations/opencti_ingest.py` | OpenCTI ingestion — Domain-Name observables, Channel SDOs, and website-channel tier/label extraction |
-| `frontend/` | React frontend built with Vite |
+| `frontend/` | React frontend built with Vite, Tailwind CSS v4 and [shadcn/ui](https://ui.shadcn.com) (Radix primitives, lucide icons). Generated components live in `frontend/src/components/ui/`; add more with `npx shadcn@latest add <name>` from `frontend/`. Theme tokens (light "paper/teal", dark "midnight/champagne", evidence-strength and OpenCTI-tier colours) are in `frontend/src/index.css` |
 
 ## Storage Model
 
