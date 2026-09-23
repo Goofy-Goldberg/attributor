@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
-import { isTerminalStatus, normalizeJob, readJsonResponse, useApi } from "@/api.js";
+import { fetchJson, isTerminalStatus, normalizeJob, useApi } from "@/api.js";
 
 // The backend has no "list jobs" endpoint, so the jobs shown in the UI are the
 // ones started from this browser. They are persisted so a scan started before
@@ -20,40 +20,37 @@ export async function postIngest({ file, targets, label }) {
     if (label) {
       formData.append("label", label);
     }
-    const response = await fetch("/api/ingest", {
+    return fetchJson("/api/ingest", {
       method: "POST",
       body: formData,
-      headers: { Accept: "application/json" },
     });
-    return readJsonResponse(response);
   }
-  const response = await fetch("/api/ingest", {
+  return fetchJson("/api/ingest", {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(targets.length === 1 ? { target: targets[0], label } : { targets, label }),
   });
-  return readJsonResponse(response);
 }
 
-function loadJobs() {
+function loadJobs(userId) {
   try {
-    const parsed = JSON.parse(window.localStorage.getItem(STORAGE_KEY) || "[]");
+    const parsed = JSON.parse(window.localStorage.getItem(`${STORAGE_KEY}.${userId}`) || "[]");
     return Array.isArray(parsed) ? parsed.filter((job) => job && job.id) : [];
   } catch {
     return [];
   }
 }
 
-function saveJobs(jobs) {
+function saveJobs(jobs, userId) {
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(jobs));
+    window.localStorage.setItem(`${STORAGE_KEY}.${userId}`, JSON.stringify(jobs));
   } catch {
     // Best effort; the in-memory list still works for this session.
   }
 }
 
-export function JobsProvider({ children }) {
-  const [jobs, setJobs] = useState(loadJobs);
+export function JobsProvider({ children, userId }) {
+  const [jobs, setJobs] = useState(() => loadJobs(userId));
   // Live snapshots from polling, keyed by job id. Not persisted: only the
   // terminal status is, so a finished job is never polled again after reload.
   const [snapshots, setSnapshots] = useState({});
@@ -62,7 +59,7 @@ export function JobsProvider({ children }) {
   // starts — targets land in the pool immediately — and again when it ends.
   const poolListeners = useRef(new Set());
 
-  useEffect(() => saveJobs(jobs), [jobs]);
+  useEffect(() => saveJobs(jobs, userId), [jobs, userId]);
 
   const addJob = useCallback((job) => {
     setJobs((current) => [{ status: "queued", startedAt: new Date().toISOString(), ...job }, ...current.filter((entry) => entry.id !== job.id)].slice(0, MAX_JOBS));

@@ -65,12 +65,13 @@ export default function ChannelsPage() {
   // The one place a path change means "same resource, narrowed differently",
   // so the previous rows stay on screen while the next page loads.
   const poolRequest = useApi(poolPath, { keepPreviousData: true });
+  const refreshPool = poolRequest.refresh;
   const domains = useMemo(() => normalizePool(poolRequest.data), [poolRequest.data]);
   const meta = getPoolPageMeta(poolRequest.data, domains.length, page, DEFAULT_PAGE_SIZE);
   const filtersActive = poolFiltersActive(filters);
   const advancedCount = advancedFilterCount(filters);
 
-  useEffect(() => onPoolChanged(() => poolRequest.refresh()), [onPoolChanged, poolRequest.refresh]);
+  useEffect(() => onPoolChanged(() => refreshPool()), [onPoolChanged, refreshPool]);
 
   const update = useCallback(
     (patch, nextPage = 1) => {

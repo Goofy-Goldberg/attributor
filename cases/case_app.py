@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 import hashlib
+from ipaddress import ip_address, ip_network
 import json
 import logging
 import mimetypes
@@ -13,6 +14,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,6 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from cases.case_runtime import CaseRuntime, build_job_response, parse_submission
+from cases import auth as api_auth
 from core.analysis_service import normalize_inputs
 from cases.case_store import get_job, healthcheck, init_db, mark_interrupted_jobs
 from cases import cache
@@ -161,6 +165,85 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+
+authenticate_request = api_auth.authenticate_request
+
+
+def _auth_client_ip(request: Request) -> str | None:
+    """Resolve a client address only through explicitly trusted proxy hops."""
+    peer = request.client.host if request.client else None
+    if not peer:
+        return None
+    configured = os.getenv("AUTH_TRUSTED_PROXY_CIDRS", "")
+    try:
+        trusted = [ip_network(value.strip(), strict=False) for value in configured.split(",") if value.strip()]
+        peer_address = ip_address(peer)
+    except ValueError:
+        return peer
+    if not any(peer_address in network for network in trusted):
+        return peer
+    chain = [part.strip() for part in request.headers.get("x-forwarded-for", "").split(",") if part.strip()]
+    for part in reversed(chain):
+        try:
+            address = ip_address(part)
+        except ValueError:
+            return peer
+        if not any(address in network for network in trusted):
+            return str(address)
+    return peer
+
+
+@app.middleware("http")
+async def require_api_login(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/") and path != "/api/health" and not path.startswith("/api/auth/") and request.method != "OPTIONS":
+        try:
+            request.state.identity = await authenticate_request(request)
+        except HTTPException as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail},
+                headers={"WWW-Authenticate": "Bearer"} if exc.status_code == 401 else None,
+            )
+        if path in {"/api/graph/recompute", "/api/graph/email"} and request.state.identity.get("role") != "admin":
+            return JSONResponse(status_code=403, content={"detail": "Admin access is required."})
+    return await call_next(request)
+
+
+@app.api_route("/api/auth/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+async def auth_proxy(path: str, request: Request) -> Response:
+    """Serve Better Auth on the same origin as the built frontend."""
+    upstream = os.getenv("AUTH_PROXY_URL")
+    if not upstream:
+        raise HTTPException(status_code=503, detail="Authentication is not configured.")
+    url = f"{upstream.rstrip('/')}/api/auth/{path}"
+    if request.url.query:
+        url += f"?{request.url.query}"
+    headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in {
+            "host", "content-length", "connection", "transfer-encoding", "forwarded",
+            "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip", "cf-connecting-ip",
+        }
+    }
+    client_ip = _auth_client_ip(request)
+    if client_ip:
+        headers["X-Forwarded-For"] = client_ip
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+            result = await client.request(request.method, url, headers=headers, content=await request.body())
+    except httpx.HTTPError as exc:
+        LOGGER.warning("Authentication proxy unavailable: %s", exc)
+        raise HTTPException(status_code=503, detail="Authentication service is unavailable.") from exc
+    outgoing = Response(content=result.content, status_code=result.status_code)
+    for key, value in result.headers.items():
+        if key.lower() not in {"content-length", "content-encoding", "transfer-encoding", "connection", "set-cookie", "date"}:
+            outgoing.headers[key] = value
+    for cookie in result.headers.get_list("set-cookie"):
+        outgoing.raw_headers.append((b"set-cookie", cookie.encode("latin-1")))
+    return outgoing
 
 
 def _etag_json_response(request: Request, content: Any) -> Response:

@@ -29,6 +29,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Spinner } from "@/components/ui/spinner";
 import { FaviconThumb, sharedNodeLabel } from "@/features/evidence.jsx";
+import { authClient } from "@/lib/auth-client.js";
 import { compareUrl, domainUrl } from "@/lib/routes.js";
 import { cn } from "@/lib/utils";
 
@@ -36,6 +37,8 @@ const VISIBLE_MEMBERS = 10;
 const VISIBLE_LINKS = 4;
 
 export default function ClustersPage() {
+  const session = authClient.useSession();
+  const isAdmin = session.data?.user?.role === "admin";
   const clustersRequest = useApi("/api/graph/clusters");
   const clusters = useMemo(() => normalizeGraphClusters(clustersRequest.data), [clustersRequest.data]);
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -67,7 +70,7 @@ export default function ClustersPage() {
             <Button aria-label="Refresh" onClick={clustersRequest.refresh} size="icon" title="Refresh" variant="ghost">
               <RefreshCwIcon className={cn(clustersRequest.loading && "animate-spin")} />
             </Button>
-            <DropdownMenu>
+            {isAdmin ? <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button aria-label="More actions" size="icon" variant="outline">
                   {recomputing ? <Spinner /> : <MoreHorizontalIcon />}
@@ -81,7 +84,7 @@ export default function ClustersPage() {
                   </DropdownMenuItem>
                 </DropdownMenuGroup>
               </DropdownMenuContent>
-            </DropdownMenu>
+            </DropdownMenu> : null}
           </>
         }
         description={
@@ -92,7 +95,7 @@ export default function ClustersPage() {
         title="Clusters"
       />
 
-      <AlertDialog onOpenChange={setConfirmOpen} open={confirmOpen}>
+      {isAdmin ? <AlertDialog onOpenChange={setConfirmOpen} open={confirmOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Rebuild the correlation graph?</AlertDialogTitle>
@@ -106,7 +109,7 @@ export default function ClustersPage() {
             <AlertDialogAction onClick={recompute}>Rebuild</AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
-      </AlertDialog>
+      </AlertDialog> : null}
 
       {clustersRequest.error ? <ErrorState message={clustersRequest.error} title="Could not load clusters" /> : null}
       {clustersRequest.loading && !clustersRequest.data ? <SkeletonRows rows={6} /> : null}

@@ -41,4 +41,9 @@ Thumbs.db
 *.sqlite3
 PROVIDERS.md
 frontend/node_modules/
+auth/node_modules/
+auth/.dev-secret
+frontend/playwright-report/
+frontend/test-results/
+.playwright-mcp/
 *.csv

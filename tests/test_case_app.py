@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import base64
+import json
+import time
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from fastapi import Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.testclient import TestClient
 
 import cases.case_app as case_app
 
 
-def _quiet(monkeypatch) -> None:
+def _quiet(monkeypatch, *, authenticated: bool = True) -> None:
     monkeypatch.setattr(case_app, "init_db", lambda: None)
+    monkeypatch.setattr(case_app, "mark_interrupted_jobs", lambda: 0)
+    monkeypatch.setattr(case_app, "healthcheck", lambda: {"status": "ok"})
     monkeypatch.setattr(case_app.runtime, "recover", lambda: None)
     # Take Redis out of the picture for every endpoint test. Without this the
     # app's lifespan warms a live cache from a live database, and the endpoint
@@ -17,6 +26,104 @@ def _quiet(monkeypatch) -> None:
     # reads, warming and invalidation all go through it, and cases.cache is
     # built to run degraded (computing live) whenever it returns None.
     monkeypatch.setattr(case_app.cache, "_redis_client", lambda: None)
+    if authenticated:
+        async def _admin(_request):
+            return {"sub": "test-admin", "role": "admin"}
+
+        monkeypatch.setattr(case_app, "authenticate_request", _admin)
+
+
+def _auth_headers(monkeypatch, *, role: str = "user", expired: bool = False, issuer: str = "http://testserver") -> dict[str, str]:
+    key = Ed25519PrivateKey.generate()
+    public = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+    async def _jwks(*, refresh=False):
+        return [{"kid": "test-key", "kty": "OKP", "crv": "Ed25519", "x": base64.urlsafe_b64encode(public).rstrip(b"=").decode()}]
+
+    monkeypatch.setenv("AUTH_ISSUER", issuer)
+    monkeypatch.setattr(case_app.api_auth, "_get_jwks", _jwks)
+
+    def _part(value):
+        return base64.urlsafe_b64encode(json.dumps(value, separators=(",", ":")).encode()).rstrip(b"=").decode()
+
+    header = _part({"alg": "EdDSA", "kid": "test-key"})
+    payload = _part({
+        "iss": issuer, "aud": issuer, "sub": "test-user",
+        "exp": time.time() - 1 if expired else time.time() + 900, "role": role,
+    })
+    signed = f"{header}.{payload}".encode()
+    signature = base64.urlsafe_b64encode(key.sign(signed)).rstrip(b"=").decode()
+    return {"Authorization": f"Bearer {header}.{payload}.{signature}"}
+
+
+def test_api_requires_login_before_running_protected_work(monkeypatch) -> None:
+    _quiet(monkeypatch, authenticated=False)
+    monkeypatch.setenv("AUTH_ISSUER", "http://testserver")
+    with TestClient(case_app.app) as client:
+        for path in ("/api/ingest", "/api/graph/recompute", "/api/graph/email", "/api/graph/connections"):
+            response = client.post(path)
+            assert response.status_code == 401, path
+        assert client.get("/api/pool").status_code == 401
+        assert client.get("/api/health").status_code == 200
+
+
+def test_regular_user_can_ingest_but_cannot_email_or_recompute(monkeypatch) -> None:
+    _quiet(monkeypatch, authenticated=False)
+    headers = _auth_headers(monkeypatch)
+    monkeypatch.setattr(case_app.runtime, "submit_case", lambda inputs, input_mode: {"case_id": "i", "job_id": "j"})
+    monkeypatch.setattr(case_app, "get_job", lambda job_id: None)
+    with TestClient(case_app.app) as client:
+        assert client.post("/api/ingest", json={"target": "example.com"}, headers=headers).status_code == 202
+        assert client.post("/api/graph/recompute", headers=headers).status_code == 403
+        assert client.post("/api/graph/email", headers=headers).status_code == 403
+
+
+def test_admin_token_allows_recompute_and_email(monkeypatch) -> None:
+    _quiet(monkeypatch, authenticated=False)
+    headers = _auth_headers(monkeypatch, role="admin")
+    monkeypatch.setattr(case_app.intel_db, "rebuild_all_correlation", lambda: {"clusters": 1})
+    from integrations import email_alerts
+    monkeypatch.setattr(email_alerts, "email_enabled", lambda: True)
+    monkeypatch.setattr(email_alerts, "send_network_graph_email", lambda png_bytes, **kwargs: True)
+    with TestClient(case_app.app) as client:
+        assert client.post("/api/graph/recompute", headers=headers).status_code == 200
+        response = client.post("/api/graph/email", headers=headers, files={"image": ("graph.png", b"png", "image/png")})
+        assert response.status_code == 200
+        assert response.json()["status"] == "sent"
+
+
+def test_expired_or_tampered_token_is_rejected(monkeypatch) -> None:
+    _quiet(monkeypatch, authenticated=False)
+    expired = _auth_headers(monkeypatch, expired=True)
+    valid = _auth_headers(monkeypatch)
+    valid["Authorization"] += "x"
+    with TestClient(case_app.app) as client:
+        assert client.get("/api/pool", headers=expired).status_code == 401
+        assert client.get("/api/pool", headers=valid).status_code == 401
+
+
+def test_issuer_url_with_trailing_slash_accepts_valid_token(monkeypatch) -> None:
+    _quiet(monkeypatch, authenticated=False)
+    headers = _auth_headers(monkeypatch, issuer="https://intel.example.org")
+    monkeypatch.setenv("AUTH_ISSUER", "https://INTEL.example.org:443/")
+    with TestClient(case_app.app) as client:
+        assert client.get("/api/meta/evidence", headers=headers).status_code == 200
+
+
+def test_auth_proxy_ignores_untrusted_forwarded_ip(monkeypatch) -> None:
+    monkeypatch.delenv("AUTH_TRUSTED_PROXY_CIDRS", raising=False)
+    request = Request({
+        "type": "http", "client": ("203.0.113.8", 1234),
+        "headers": [(b"x-forwarded-for", b"198.51.100.1")],
+    })
+    assert case_app._auth_client_ip(request) == "203.0.113.8"
+
+    monkeypatch.setenv("AUTH_TRUSTED_PROXY_CIDRS", "192.0.2.10/32")
+    request = Request({
+        "type": "http", "client": ("192.0.2.10", 1234),
+        "headers": [(b"x-forwarded-for", b"198.51.100.1, 203.0.113.8")],
+    })
+    assert case_app._auth_client_ip(request) == "203.0.113.8"
 
 
 def test_evidence_meta_endpoint(monkeypatch) -> None:

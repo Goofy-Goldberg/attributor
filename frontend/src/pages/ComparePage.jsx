@@ -25,6 +25,12 @@ import { domainUrl } from "@/lib/routes.js";
 const EXPANSION_MAX_DOMAINS = 30;
 const RUN_DEBOUNCE_MS = 400;
 
+// The API may return the same channel with different casing or a trailing dot
+// trimmed. Use this only for comparisons; keep the server's spelling for UI.
+function domainKey(value) {
+  return String(value || "").trim().toLowerCase().replace(/\.$/, "");
+}
+
 export default function ComparePage() {
   const [params, setParams] = useSearchParams();
   const selected = useMemo(() => [...new Set(params.getAll("d").filter(Boolean))], [params]);
@@ -376,22 +382,51 @@ function useComparison(selected) {
         });
       });
 
-      const expanded = relatedTargets.size > 0 ? [...selected, ...relatedTargets].slice(0, EXPANSION_MAX_DOMAINS) : selected;
+      const scoredSelections = selected.slice(0, EXPANSION_MAX_DOMAINS);
+      const relatedSlots = EXPANSION_MAX_DOMAINS - scoredSelections.length;
+      const expanded = [...scoredSelections, ...[...relatedTargets].slice(0, relatedSlots)];
+      const selectionWarning =
+        selected.length > scoredSelections.length
+          ? `Showing ${scoredSelections.length} of ${selected.length} selected channels.`
+          : null;
+      const expansionWarning =
+        relatedTargets.size > relatedSlots
+          ? `Showing ${expanded.length - scoredSelections.length} of ${relatedTargets.size} related channels.`
+          : null;
       const finalResult = await fetchJson("/api/graph/connections", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ domains: expanded, pool_links: true }),
         signal,
       });
+      const returnedDomains = Array.isArray(finalResult.domains) ? finalResult.domains : [];
+      const serverTruncated = returnedDomains.length < expanded.length;
       // Intersect against the canonical names the backend resolved, since the
-      // raw selection may differ in case or form.
-      const resolvedSeeds = (finalResult.domains || []).filter((domain) => seedSet.has(domain));
+      // raw selection may differ in case or have a trailing dot.
+      const seedKeys = new Set(selected.flatMap((domain) => {
+        const key = domainKey(domain);
+        return key ? [key] : [];
+      }));
+      const resolvedSeeds = returnedDomains.filter((domain) => seedKeys.has(domainKey(domain)));
+      const warnings = [];
+      if (failures.length > 0) {
+        warnings.push(
+          `Could not load the multi-hop neighbourhood for ${failures.join(", ")}. Channels reachable only through those are missing from this view.`,
+        );
+      }
+      if (expansionWarning) {
+        warnings.push(expansionWarning);
+      }
+      if (selectionWarning) {
+        warnings.push(selectionWarning);
+      }
+      if (serverTruncated) {
+        warnings.push(
+          `The server returned ${returnedDomains.length} of ${expanded.length} submitted channels; some names could not be resolved or were limited by the server.`,
+        );
+      }
       setRelatedChains(chainMap);
-      setPartialWarning(
-        failures.length > 0
-          ? `Could not load the multi-hop neighbourhood for ${failures.join(", ")}. Channels reachable only through those are missing from this view.`
-          : null,
-      );
+      setPartialWarning(warnings.length > 0 ? warnings.join(" ") : null);
       setSeedDomains(resolvedSeeds.length > 0 ? resolvedSeeds : selected);
       setResult(finalResult);
     } catch (err) {

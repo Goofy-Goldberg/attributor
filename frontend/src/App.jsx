@@ -1,7 +1,9 @@
 import { lazy, Suspense } from "react";
-import { Navigate, Route, Routes, useLocation } from "react-router";
+import { Navigate, Outlet, Route, Routes, useLocation } from "react-router";
 
 import { SkeletonRows } from "@/components/page.jsx";
+import { JobsProvider } from "@/features/jobs.jsx";
+import { authClient } from "@/lib/auth-client.js";
 import AppLayout from "@/shell/AppLayout.jsx";
 
 // Pages load on demand so the first paint only pays for the shell and the page
@@ -12,6 +14,18 @@ const ComparePage = lazy(() => import("@/pages/ComparePage.jsx"));
 const DomainPage = lazy(() => import("@/pages/DomainPage.jsx"));
 const EvidencePage = lazy(() => import("@/pages/EvidencePage.jsx"));
 const NotFoundPage = lazy(() => import("@/pages/NotFoundPage.jsx"));
+const LoginPage = lazy(() => import("@/pages/LoginPage.jsx"));
+
+function RequireAuth() {
+  const session = authClient.useSession();
+  if (session.isPending) {
+    return <SkeletonRows rows={6} />;
+  }
+  if (!session.data) {
+    return <Navigate replace to="/login" />;
+  }
+  return <JobsProvider key={session.data.user.id} userId={session.data.user.id}><Outlet /></JobsProvider>;
+}
 
 // /connections was the old combined compare + browse-by-edge page. Keep old
 // links working by forwarding them (query string included) to /compare.
@@ -27,7 +41,9 @@ function page(element) {
 export default function App() {
   return (
     <Routes>
-      <Route element={<AppLayout />}>
+      <Route element={page(<LoginPage />)} path="login" />
+      <Route element={<RequireAuth />}>
+        <Route element={<AppLayout />}>
         <Route element={page(<ChannelsPage />)} index />
         <Route element={page(<DomainPage />)} path="domain/:value" />
         <Route element={page(<ComparePage />)} path="compare" />
@@ -35,6 +51,7 @@ export default function App() {
         <Route element={page(<ClustersPage />)} path="clusters" />
         <Route element={<LegacyConnectionsRedirect />} path="connections" />
         <Route element={page(<NotFoundPage />)} path="*" />
+        </Route>
       </Route>
     </Routes>
   );

@@ -6,10 +6,37 @@ services:
     # The development stack has a self-contained database URL below, so an
     # operator can start it before creating a provider-key .env file.
     env_file: !reset []
+    environment:
+      AUTH_ISSUER: http://localhost:5173
     volumes:
       - ./:/app
     networks: !reset
       - default
+
+  auth:
+    env_file: !reset []
+    environment:
+      NODE_ENV: development
+      AUTH_DEV_MODE: "true"
+      AUTH_DEV_SECRET_FILE: /app/data/dev-secret
+      BETTER_AUTH_URL: http://localhost:5173
+      BETTER_AUTH_SECRET: ""
+      AUTH_EMAIL_DOMAINS: stratc.org
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+      SMTP_STARTTLS: "false"
+      AUTH_MAIL_FROM: IP Intel <no-reply@stratc.org>
+    depends_on:
+      mailpit:
+        condition: service_started
+    volumes:
+      - auth_dev_secret:/app/data
+
+  mailpit:
+    image: axllent/mailpit:v1.27
+    ports:
+      # Sign-in codes must not be visible to anyone who can reach the LAN UI.
+      - "127.0.0.1:8025:8025"
 
   frontend:
     image: node:24-slim
@@ -17,6 +44,7 @@ services:
     command: sh -c "npm ci && npm run dev -- --host 0.0.0.0"
     environment:
       VITE_API_PROXY_TARGET: http://ip-intel:8000
+      VITE_AUTH_PROXY_TARGET: http://auth:3000
     ports:
       - "5173:5173"
     volumes:
@@ -30,3 +58,4 @@ services:
 
 volumes:
   frontend_node_modules:
+  auth_dev_secret:

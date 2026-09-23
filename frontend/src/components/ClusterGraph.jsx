@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { drag as d3Drag } from "d3-drag";
 import { zoom as d3Zoom, zoomIdentity } from "d3-zoom";
 import { select as d3Select } from "d3-selection";
@@ -24,6 +24,9 @@ import {
   XIcon,
 } from "lucide-react";
 import { Link } from "react-router";
+
+import { fetchJson } from "@/api.js";
+import { authClient } from "@/lib/auth-client.js";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -481,6 +484,8 @@ const ClusterGraph = memo(function ClusterGraph({
   exportFileName = "network-graph",
   pinSeeds = false,
 }) {
+  const session = authClient.useSession();
+  const isAdmin = session.data?.user?.role === "admin";
   const statusId = useId();
   const containerRef = useRef(null);
   const svgRef = useRef(null);
@@ -544,7 +549,9 @@ const ClusterGraph = memo(function ClusterGraph({
   const [hoveredNode, setHoveredNode] = useState(null);
   const [hoveredEdge, setHoveredEdge] = useState(null);
   const selectedRef = useRef({ node: null, edge: null });
-  selectedRef.current = { node: selectedNode, edge: selectedEdge };
+  useLayoutEffect(() => {
+    selectedRef.current = { node: selectedNode, edge: selectedEdge };
+  }, [selectedNode, selectedEdge]);
 
   // Track the rendered width so the layout adapts to the panel size.
   useEffect(() => {
@@ -798,6 +805,9 @@ const ClusterGraph = memo(function ClusterGraph({
     const selectedNodeHidden = selectedNode && !visibleNodes.some((node) => node.id === selectedNode);
     const selectedEdgeHidden = selectedEdge && !visibleEvidence.some((edge) => edgeKey(edge) === selectedEdge);
     if (selectedNodeHidden || selectedEdgeHidden) {
+      // Filtering invalidates the current map selection; clearing it here
+      // keeps the detail panel in sync with what is still visible.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       clearFocus();
     }
   }, [clearFocus, selectedEdge, selectedNode, visibleEvidence, visibleNodes]);
@@ -857,19 +867,21 @@ const ClusterGraph = memo(function ClusterGraph({
   // a ref lets applyStyles stay referentially stable (empty deps) so the build
   // effect can call it without rebuilding the simulation on every recolour.
   const styleRef = useRef({});
-  styleRef.current = {
-    activeScope,
-    colorFor,
-    displayEdgeCount: displayEdges.filter((edge) => edgeKind(edge) === "evidence").length,
-    displayNodeCount: displayNodes.length,
-    hoveredNode,
-    hoveredEdge,
-    labelMode,
-    metrics,
-    seedTargets,
-    selectedNode,
-    selectedEdge,
-  };
+  useLayoutEffect(() => {
+    styleRef.current = {
+      activeScope,
+      colorFor,
+      displayEdgeCount: displayEdges.filter((edge) => edgeKind(edge) === "evidence").length,
+      displayNodeCount: displayNodes.length,
+      hoveredNode,
+      hoveredEdge,
+      labelMode,
+      metrics,
+      seedTargets,
+      selectedNode,
+      selectedEdge,
+    };
+  }, [activeScope, colorFor, displayEdges, displayNodes, hoveredNode, hoveredEdge, labelMode, metrics, seedTargets, selectedNode, selectedEdge]);
 
   // Apply colour / label / highlight to the existing selections in place.
   // Selection and hover are pure presentation now: the full filtered graph
@@ -1799,11 +1811,7 @@ const ClusterGraph = memo(function ClusterGraph({
         form.append("report", htmlBlob, "network-graph-interactive.html");
       }
       form.append("domains", JSON.stringify(result.seedNames));
-      const response = await fetch("/api/graph/email", { method: "POST", body: form });
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        throw new Error(body.detail || "Couldn't send the email.");
-      }
+      await fetchJson("/api/graph/email", { method: "POST", body: form });
       setEmailState({ status: "sent", message: "Emailed to the configured recipients." });
     } catch (err) {
       setEmailState({ status: "error", message: err.message || "Couldn't send the email." });
@@ -2090,13 +2098,15 @@ const ClusterGraph = memo(function ClusterGraph({
                   Interactive HTML (offline)
                 </DropdownMenuItem>
               </DropdownMenuGroup>
-              <DropdownMenuSeparator />
-              <DropdownMenuGroup>
-                <DropdownMenuItem onSelect={emailGraph}>
-                  <MailIcon />
-                  Email to configured recipients
-                </DropdownMenuItem>
-              </DropdownMenuGroup>
+              {isAdmin ? <DropdownMenuSeparator /> : null}
+              {isAdmin ? (
+                <DropdownMenuGroup>
+                  <DropdownMenuItem onSelect={emailGraph}>
+                    <MailIcon />
+                    Email to configured recipients
+                  </DropdownMenuItem>
+                </DropdownMenuGroup>
+              ) : null}
             </DropdownMenuContent>
           </DropdownMenu>
         </div>

@@ -22,6 +22,7 @@ React + FastAPI application for domain and IP OSINT, origin discovery, and infra
 |---|---|
 | `app.py` | Entry point — re-exports the FastAPI `app` from `cases/case_app.py` |
 | `cases/case_app.py` | FastAPI routes (pool, ingest, connections, jobs), static frontend serving, CORS |
+| `auth/` | Better Auth service for email codes, Mattermost sign-in, sessions, and API signing keys; see [authentication](docs/authentication.md) |
 | `cases/case_runtime.py` | Ingest/job orchestration and background workers (internal; no longer user-facing "cases") |
 | `cases/case_store.py` | PostgreSQL schema/queries for the internal ingest jobs (legacy cases/pairs/clusters tables retained, unused by the UI) |
 | `core/analysis_service.py` | Per-target analysis runner, bridges the ingest layer and `core/basic.py`'s engine |
@@ -71,7 +72,10 @@ uv sync
 uv run uvicorn app:app --reload
 ```
 
-The API runs on `http://127.0.0.1:8000`. You need a reachable PostgreSQL instance; set `DATABASE_URL` in a `.env` file or the environment.
+The API runs on `http://127.0.0.1:8000`. You need PostgreSQL and the Better
+Auth service as well; the development Compose stack below starts both. Set
+`DATABASE_URL`, `AUTH_PROXY_URL`, `AUTH_JWKS_URL`, and `AUTH_ISSUER` when
+running FastAPI outside Compose.
 
 ### Frontend
 
@@ -81,7 +85,9 @@ npm install
 npm run dev
 ```
 
-The Vite dev server runs on `http://127.0.0.1:5173` and proxies `/api` to the FastAPI backend on `http://127.0.0.1:8000`.
+The Vite dev server runs on `http://localhost:5173` and proxies `/api` to
+FastAPI and `/api/auth` to Better Auth. Set `VITE_API_PROXY_TARGET` and
+`VITE_AUTH_PROXY_TARGET` if those services are not on the default local ports.
 Use Node `22.12+` locally for the frontend toolchain; the containers use Node 24 LTS.
 
 ### Development containers
@@ -93,9 +99,11 @@ the host, use the development Compose overlay:
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
-Open `http://127.0.0.1:5173`. The FastAPI source is bind-mounted into the
+Open `http://localhost:5173`. The FastAPI source is bind-mounted into the
 backend container and reloads automatically; the Vite service bind-mounts the
-frontend and provides hot reload. PostgreSQL and Redis remain containerized.
+frontend and provides hot reload. PostgreSQL, Redis, Better Auth, and Mailpit
+remain containerized. Sign-in codes sent to `stratc.org` test addresses are
+visible at `http://localhost:8025`; no external email is sent by this overlay.
 The overlay deliberately removes the optional external VPN network, so it does
 not require the production VPN stack.
 
@@ -109,7 +117,10 @@ cd ..
 uv run uvicorn app:app --host 0.0.0.0 --port 9000
 ```
 
-When `frontend/dist` exists, FastAPI serves the compiled React frontend directly.
+When `frontend/dist` exists, FastAPI serves the compiled React frontend
+directly and proxies `/api/auth` to Better Auth. Start Better Auth and set
+the auth environment variables described in [authentication](docs/authentication.md)
+before using this standalone run.
 
 ## Docker
 
@@ -128,6 +139,7 @@ The Docker setup:
 - builds the React frontend with Vite in a Node stage
 - runs the FastAPI backend with Uvicorn on container port `8000`, published as `9000`
 - runs a PostgreSQL 16 container for all storage (jobs, legacy app tables, and raw intel)
+- runs Better Auth with its own PostgreSQL `auth` schema; see [authentication](docs/authentication.md) for required secrets and Mattermost setup
 - mounts `./data` for downloaded artifacts and any other persistent files
 
 ## VPN / Outbound Proxy
@@ -212,6 +224,8 @@ extras already declared in `pyproject.toml`.
 ## API Overview
 
 There is no case API — everything is the global pool and its connections.
+All `/api/*` routes except health and sign-in require a Better Auth bearer
+token. Graph recompute and graph email require the `admin` role.
 
 ### Ingestion
 

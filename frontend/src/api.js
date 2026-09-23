@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { authorizedHeaders } from "@/lib/auth-client.js";
+
 // Upper bound on any single request. Without it a stalled intel lookup — the
 // VPN sidecar down, a provider hanging — leaves the UI spinning indefinitely
 // with no way for the user to tell a slow answer from a dead one.
@@ -39,6 +41,10 @@ function isAbort(error) {
 // Bounded because /api/search paths are per-keystroke and unbounded.
 const RESPONSE_CACHE_LIMIT = 50;
 const responseCache = new Map();
+
+export function clearResponseCache() {
+  responseCache.clear();
+}
 
 function readCache(path) {
   return path ? responseCache.get(path) : undefined;
@@ -136,11 +142,11 @@ export function useApi(path, options = {}) {
       const request = requestSignal();
       pending.add(request);
       try {
-        const headers = { Accept: "application/json" };
+        const headers = new Headers({ Accept: "application/json" });
         if (lastEtag) {
-          headers["If-None-Match"] = lastEtag;
+          headers.set("If-None-Match", lastEtag);
         }
-        const response = await fetch(path, { headers, signal: request.signal });
+        const response = await fetch(path, { headers: await authorizedHeaders(headers), signal: request.signal });
 
         if (!active || currentRequest !== requestSequence) {
           return;
@@ -318,10 +324,14 @@ export async function fetchJson(path, init = {}) {
   const onCallerAbort = () => request.abort();
   callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
   try {
+    const headers = new Headers(rest.headers);
+    if (!headers.has("Accept")) {
+      headers.set("Accept", "application/json");
+    }
     const response = await fetch(path, {
       ...rest,
       signal: request.signal,
-      headers: { Accept: "application/json", ...(rest.headers || {}) },
+      headers: await authorizedHeaders(headers),
     });
     return await readJsonResponse(response);
   } catch (error) {

@@ -49,6 +49,32 @@ services:
       retries: 10
     restart: unless-stopped
 
+  auth:
+    build:
+      context: .
+      dockerfile: auth/Dockerfile
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://ip_intel:ip_intel@postgres:5432/ip_intel
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:9000}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-}
+      AUTH_EMAIL_DOMAINS: ${AUTH_EMAIL_DOMAINS:-stratc.org}
+      AUTH_MAIL_FROM: ${AUTH_MAIL_FROM:-}
+      MATTERMOST_URL: ${MATTERMOST_URL:-}
+      MATTERMOST_OAUTH_CLIENT_ID: ${MATTERMOST_OAUTH_CLIENT_ID:-}
+      MATTERMOST_OAUTH_CLIENT_SECRET: ${MATTERMOST_OAUTH_CLIENT_SECRET:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
   ip-intel:
     build: .
     ports:
@@ -61,6 +87,10 @@ services:
       # the app runs unchanged without the redis service (cases/cache.py).
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       APP_BASE_URL: ${APP_BASE_URL:-http://localhost:9000}
+      AUTH_PROXY_URL: http://auth:3000
+      AUTH_JWKS_URL: http://auth:3000/api/auth/jwks
+      AUTH_ISSUER: ${BETTER_AUTH_URL:-http://localhost:9000}
+      AUTH_TRUSTED_PROXY_CIDRS: ${AUTH_TRUSTED_PROXY_CIDRS:-}
       # Empty by default = direct connection / no rotation, so runs without the
       # `vpn` profile work unchanged. To enable the rotating VPN egress, set in
       # .env (the `vpn` profile must be up):
@@ -78,6 +108,8 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      auth:
         condition: service_healthy
     restart: unless-stopped
     mem_limit: 6g
