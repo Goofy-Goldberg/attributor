@@ -1,5 +1,5 @@
 import { ChevronDownIcon, GitCompareArrowsIcon, LinkIcon, RouteIcon, SearchIcon, UnplugIcon } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
 import {
@@ -40,6 +40,10 @@ import { cn } from "@/lib/utils";
 const INITIAL_CONNECTIONS = 25;
 const TABS = ["connections", "evidence", "intel", "hosts"];
 
+function pairVerdictKey(a, b) {
+  return String(a) < String(b) ? `${a}\u0000${b}` : `${b}\u0000${a}`;
+}
+
 export default function DomainPage() {
   const { value } = useParams();
   const [params, setParams] = useSearchParams();
@@ -47,7 +51,18 @@ export default function DomainPage() {
   const profileRequest = useApi(`/api/domain/${encodeURIComponent(value)}`);
   const linksRequest = useApi(`/api/graph/links/${encodeURIComponent(value)}`);
   const profile = profileRequest.data;
-  const links = useMemo(() => normalizeGraphLinks(linksRequest.data), [linksRequest.data]);
+  const [savedVerdicts, setSavedVerdicts] = useState(new Map());
+  const links = useMemo(
+    () =>
+      normalizeGraphLinks(linksRequest.data).map((link) => ({
+        ...link,
+        verdictSummary: savedVerdicts.get(pairVerdictKey(value, link.target)) || link.verdictSummary,
+      })),
+    [linksRequest.data, savedVerdicts, value],
+  );
+  const handleVerdictSaved = useCallback(({ a, b, summary }) => {
+    setSavedVerdicts((current) => new Map(current).set(pairVerdictKey(a, b), summary));
+  }, []);
   const intel = profile?.intel || null;
   const otherHosts = (profile?.hosts || []).filter((host) => host.value !== profile?.domain);
   const selectorCount = (profile?.selectors || []).length;
@@ -157,7 +172,7 @@ export default function DomainPage() {
             </TabsList>
 
             <TabsContent className="flex flex-col gap-8 pt-4" value="connections">
-              <DirectConnections links={links} request={linksRequest} value={value} />
+              <DirectConnections links={links} onVerdictSaved={handleVerdictSaved} request={linksRequest} value={value} />
               <RelatedThroughSection directTargets={directTargets} value={value} />
               <FindPathSection value={value} />
             </TabsContent>
@@ -191,7 +206,7 @@ function CountBadge({ value }) {
   );
 }
 
-function DirectConnections({ value, links, request }) {
+function DirectConnections({ value, links, onVerdictSaved, request }) {
   const [showAll, setShowAll] = useState(false);
   const visible = showAll ? links : links.slice(0, INITIAL_CONNECTIONS);
 
@@ -216,7 +231,7 @@ function DirectConnections({ value, links, request }) {
       {visible.length > 0 ? (
         <div className="flex flex-col gap-2">
           {visible.map((link) => (
-            <ConnectionRow key={link.target} leftLabel={value} link={link} rightLabel={link.target} />
+            <ConnectionRow key={link.target} leftLabel={value} link={link} onVerdictSaved={onVerdictSaved} rightLabel={link.target} />
           ))}
           {/* Never truncate silently: 25 connections and 250 look the same
               otherwise. */}

@@ -438,6 +438,50 @@ export function normalizeGraphLink(item, index = 0) {
     strength: pickFirst(raw, ["strength"]) || null,
     sharedNodeCount: pickFirst(raw, ["shared_node_count", "sharedNodeCount"], null),
     evidence: coerceArray(raw.evidence).map((node, nodeIndex) => normalizeSharedNode(node, nodeIndex)),
+    verdictSummary: raw.verdict_summary || raw.verdictSummary ? normalizeVerdictSummary(raw.verdict_summary || raw.verdictSummary) : null,
+  };
+}
+
+const VERDICT_VALUES = new Set(["same_owner", "different_owner", "unsure"]);
+
+// Verdict responses are also returned by /api/verdicts after an analyst saves
+// a decision. Keep that shape in one normalizer so a graph link, a GET refresh,
+// and a PUT response all render identically.
+export function normalizeVerdictSummary(payload) {
+  const raw = payload?.verdict_summary || payload?.verdictSummary || payload?.summary || payload || {};
+  const counts = raw.counts || {};
+  const count = (key) => {
+    const value = Number(counts[key] ?? counts[key.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase())] ?? 0);
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  };
+
+  return {
+    counts: {
+      same_owner: count("same_owner"),
+      different_owner: count("different_owner"),
+      unsure: count("unsure"),
+    },
+    verdicts: coerceArray(raw.verdicts)
+      .flatMap((verdict, index) => {
+        const value = pickFirst(verdict, ["verdict"], null);
+        if (!VERDICT_VALUES.has(value)) {
+          return [];
+        }
+        return [{
+          id: pickFirst(verdict, ["id", "verdict_id", "verdictId"], `verdict-${index}`),
+          userId: readableValue(pickFirst(verdict, ["user_id", "userId"], "")),
+          userDisplay: readableValue(pickFirst(verdict, ["user_display", "userDisplay", "user_name", "userName"], "")),
+          verdict: value,
+          note: readableValue(pickFirst(verdict, ["note"], "")),
+          createdAt: pickFirst(verdict, ["created_at", "createdAt"], null),
+          score: Number(pickFirst(verdict, ["score"], 0)) || 0,
+          strength: pickFirst(verdict, ["strength"], null),
+          evidenceKinds: coerceArray(pickFirst(verdict, ["evidence_kinds", "evidenceKinds"], [])).flatMap((kind) => {
+            const value = readableValue(kind);
+            return value ? [value] : [];
+          }),
+        }];
+      }),
   };
 }
 

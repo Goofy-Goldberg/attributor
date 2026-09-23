@@ -1,12 +1,15 @@
-import { ArrowRightIcon, ChevronDownIcon, CopyIcon, InfoIcon } from "lucide-react";
+import { ArrowRightIcon, ChevronDownIcon, CopyIcon, InfoIcon, SaveIcon } from "lucide-react";
 import { memo, useState } from "react";
 import { Link } from "react-router";
 import { toast } from "sonner";
 
-import { formatDate, formatLabel, formatNumber } from "@/api.js";
+import { fetchJson, formatDate, formatLabel, formatNumber, normalizeVerdictSummary, useApi } from "@/api.js";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
+import { Textarea } from "@/components/ui/textarea";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { domainUrl } from "@/lib/routes.js";
 import { cn } from "@/lib/utils";
@@ -399,12 +402,144 @@ function kindSummary(evidence) {
   return [...counts.entries()];
 }
 
+const VERDICT_OPTIONS = [
+  { value: "same_owner", label: "Same owner" },
+  { value: "different_owner", label: "Different owner" },
+  { value: "unsure", label: "Unsure" },
+];
+
+function verdictLabel(value) {
+  return VERDICT_OPTIONS.find((option) => option.value === value)?.label || "Unknown";
+}
+
+function hasVerdicts(summary) {
+  return Object.values(summary?.counts || {}).some((count) => count > 0) || (summary?.verdicts || []).length > 0;
+}
+
+function verdictSummaryText(summary) {
+  const counts = summary?.counts || {};
+  const present = VERDICT_OPTIONS.filter((option) => counts[option.value] > 0);
+  if (present.length === 0) {
+    return "No analyst verdicts yet.";
+  }
+  const decisions = present.map((option) => `${counts[option.value]} ${option.label.toLowerCase()}`).join(", ");
+  return present.length > 1 ? `Analysts disagree: ${decisions}.` : `${decisions} verdict${counts[present[0].value] === 1 ? "" : "s"}.`;
+}
+
+function VerdictBadges({ summary }) {
+  if (!hasVerdicts(summary)) {
+    return null;
+  }
+  return (
+    <div aria-label={verdictSummaryText(summary)} className="flex flex-wrap gap-1">
+      {VERDICT_OPTIONS.filter((option) => summary.counts[option.value] > 0).map((option) => (
+        <Badge key={option.value} variant="outline">
+          {option.label} {summary.counts[option.value]}
+        </Badge>
+      ))}
+    </div>
+  );
+}
+
+function PairVerdicts({ a, b, enabled, initialSummary, onSaved }) {
+  const query = a && b ? new URLSearchParams({ a, b }).toString() : null;
+  const verdictRequest = useApi(enabled && query ? `/api/verdicts?${query}` : null);
+  const [savedSummary, setSavedSummary] = useState(null);
+  const [verdict, setVerdict] = useState("");
+  const [note, setNote] = useState("");
+  const [saving, setSaving] = useState(false);
+  const summary = savedSummary || (verdictRequest.data ? normalizeVerdictSummary(verdictRequest.data) : initialSummary) || normalizeVerdictSummary();
+
+  const handleVerdictChange = (value) => {
+    if (value) {
+      setVerdict(value);
+    }
+  };
+
+  const save = async () => {
+    if (!verdict || !a || !b) {
+      return;
+    }
+    setSaving(true);
+    try {
+      const response = await fetchJson("/api/verdicts", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ a, b, verdict, note: note.trim() }),
+      });
+      const updatedSummary = normalizeVerdictSummary(response);
+      setSavedSummary(updatedSummary);
+      onSaved(updatedSummary);
+      setNote("");
+      verdictRequest.refresh();
+      toast.success("Verdict saved");
+    } catch (error) {
+      toast.error(error.message || "Could not save the verdict.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section aria-label="Analyst verdicts" className="flex flex-col gap-4 border-t pt-3">
+      <div className="flex flex-col gap-1">
+        <span className="text-sm font-medium">Analyst verdicts</span>
+        <p className="text-muted-foreground text-sm">{verdictSummaryText(summary)}</p>
+        <VerdictBadges summary={summary} />
+      </div>
+
+      {verdictRequest.error ? <p className="text-destructive text-sm">Could not refresh verdicts: {verdictRequest.error}</p> : null}
+      {summary.verdicts.length > 0 ? (
+        <ul className="flex flex-col gap-2">
+          {summary.verdicts.map((entry) => (
+            <li className="bg-muted/50 flex flex-col gap-1 rounded-md p-2 text-sm" key={entry.id}>
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge variant="secondary">{verdictLabel(entry.verdict)}</Badge>
+                <span className="font-medium">{entry.userDisplay || entry.userId || "Analyst"}</span>
+                {entry.createdAt ? <span className="text-muted-foreground text-xs">{formatDate(entry.createdAt)}</span> : null}
+              </div>
+              {entry.note ? <p>{entry.note}</p> : null}
+              {entry.evidenceKinds.length > 0 ? (
+                <p className="text-muted-foreground text-xs">Evidence reviewed: {entry.evidenceKinds.map(sharedNodeLabel).join(", ")}</p>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+
+      <FieldGroup>
+        <Field>
+          <FieldLabel>Record your assessment</FieldLabel>
+          <ToggleGroup onValueChange={handleVerdictChange} size="sm" type="single" value={verdict} variant="outline">
+            {VERDICT_OPTIONS.map((option) => (
+              <ToggleGroupItem key={option.value} value={option.value}>
+                {option.label}
+              </ToggleGroupItem>
+            ))}
+          </ToggleGroup>
+          <FieldDescription>Save your own assessment. Existing assessments stay visible when analysts disagree.</FieldDescription>
+        </Field>
+        <Field>
+          <FieldLabel htmlFor={`verdict-note-${query}`}>Note (optional)</FieldLabel>
+          <Textarea id={`verdict-note-${query}`} onChange={(event) => setNote(event.target.value)} placeholder="What evidence supports this assessment?" value={note} />
+        </Field>
+        <Button className="self-start" disabled={!verdict || saving || !a || !b} onClick={save} size="sm">
+          <SaveIcon data-icon="inline-start" />
+          {saving ? "Saving…" : "Save verdict"}
+        </Button>
+      </FieldGroup>
+    </section>
+  );
+}
+
 // One scored connection between two channels: a compact summary row that
 // expands into the evidence behind the score. `showPair` renders "a ↔ b"
 // (comparison lists); otherwise the row names only the other side, since the
 // anchor is the page the analyst is already on.
-export const ConnectionRow = memo(function ConnectionRow({ link, leftLabel, rightLabel, showPair = false, defaultOpen = false }) {
+export const ConnectionRow = memo(function ConnectionRow({ link, leftLabel, onVerdictSaved, rightLabel, showPair = false, defaultOpen = false }) {
   const [open, setOpen] = useState(defaultOpen);
+  const [savedVerdictSummary, setSavedVerdictSummary] = useState(null);
+  const verdictSummary = savedVerdictSummary || link.verdictSummary;
   const kinds = kindSummary(link.evidence);
   const other = rightLabel || link.target;
 
@@ -440,6 +575,7 @@ export const ConnectionRow = memo(function ConnectionRow({ link, leftLabel, righ
                 {kinds.length > 4 ? <Badge variant="outline">+{kinds.length - 4} more</Badge> : null}
                 {kinds.length === 0 ? <span className="text-muted-foreground text-xs">No evidence recorded</span> : null}
               </div>
+              <VerdictBadges summary={verdictSummary} />
             </div>
             <ChevronDownIcon
               className={cn("text-muted-foreground size-4 shrink-0 transition-transform", open && "rotate-180")}
@@ -456,8 +592,18 @@ export const ConnectionRow = memo(function ConnectionRow({ link, leftLabel, righ
         ) : null}
       </div>
       <CollapsibleContent>
-        <div className="border-t p-3">
+        <div className="flex flex-col gap-4 border-t p-3">
           <EvidenceList evidence={link.evidence} leftLabel={leftLabel || "A"} rightLabel={other || "B"} />
+          <PairVerdicts
+            a={leftLabel}
+            b={other}
+            enabled={open}
+            initialSummary={verdictSummary}
+            onSaved={(summary) => {
+              setSavedVerdictSummary(summary);
+              onVerdictSaved?.({ a: leftLabel, b: other, summary });
+            }}
+          />
         </div>
       </CollapsibleContent>
     </Collapsible>

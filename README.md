@@ -255,6 +255,15 @@ token. Graph recompute and graph email require the `admin` role.
 - `GET /api/graph/related/{value}` — a channel's precomputed multi-hop neighborhood (direct links plus everything reachable through an intermediary), strongest/shortest first. Query params `max_hops`, `limit`.
 - `POST /api/graph/recompute` — global recompute: rebuild the whole correlation graph + clusters from stored intel (no rescanning).
 
+### Analyst verdicts
+
+Analysts can label any pair of channels as **Same owner**, **Different**, or **Unsure**, with an optional note. The database keeps every submission, including changed opinions. The most recent submission from each user is their current verdict, and pair summaries count one current verdict per user. Graph link and selected-pair responses include `verdict_summary` with those counts and the current verdicts. Verdicts do not change match scores.
+
+- `PUT /api/verdicts` — JSON body `{"a":"a.com","b":"b.com","verdict":"same_owner","note":"Optional context"}`. Domain inputs are reduced to registrable domains and stored in alphabetical order. The server records the current match score, strength, and evidence kinds alongside the verified user's ID and available display claim.
+- `GET /api/verdicts?a=a.com&b=b.com` — current verdicts for one pair.
+- `GET /api/verdicts?domain=a.com` — every labelled pair involving that channel, including pairs with no scored connection.
+- `GET /api/verdicts/export` — admin-only full history as JSON; add `?format=csv` for a CSV download. This export contains historical score snapshots for calibration.
+
 ### Search
 
 - `GET /api/search?q=&limit=` — ranked domain / selector-value matches for the global search box (`db/intel_db.py`'s `search_targets`).

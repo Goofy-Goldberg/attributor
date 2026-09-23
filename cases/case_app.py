@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import csv
 import hashlib
 from ipaddress import ip_address, ip_network
+from io import StringIO
 import json
 import logging
 import mimetypes
@@ -380,6 +382,95 @@ def api_domain(value: str, request: Request) -> Response:
 
 # ── Global correlation graph (case-free) ─────────────────────────────────────
 
+_EMPTY_VERDICT_SUMMARY = {"counts": {"same_owner": 0, "different_owner": 0, "unsure": 0}, "verdicts": []}
+
+
+def _csv_safe(value: Any) -> Any:
+    """Keep analyst notes and display names inert in spreadsheet viewers."""
+    if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
+
+
+def _pair_verdict_summary(a: str, b: str) -> dict[str, Any]:
+    key = intel_db.canonical_verdict_pair(a, b)
+    return intel_db.verdict_summaries_for_pairs([key]).get(key, _EMPTY_VERDICT_SUMMARY)
+
+
+@app.put("/api/verdicts")
+async def api_record_verdict(request: Request) -> dict[str, Any]:
+    """Record a user's new verdict while preserving their earlier judgements."""
+    try:
+        payload = await request.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Provide a JSON verdict.") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Provide a JSON verdict.")
+    try:
+        a, b = intel_db.canonical_verdict_pair(payload.get("a"), payload.get("b"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    verdict = payload.get("verdict")
+    if not isinstance(verdict, str) or verdict not in intel_db.VERDICTS:
+        raise HTTPException(status_code=400, detail="Choose same owner, different owner, or unsure.")
+    note = payload.get("note")
+    if note is not None and not isinstance(note, str):
+        raise HTTPException(status_code=400, detail="The note must be text.")
+    note = note.strip() or None if note is not None else None
+    if note and len(note) > 10000:
+        raise HTTPException(status_code=400, detail="The note is too long.")
+    identity = request.state.identity
+    user_display = identity.get("name") or identity.get("preferred_username") or identity.get("email")
+    # A fresh server-side score is the historical snapshot. Caller-supplied
+    # score and evidence fields are deliberately ignored.
+    link = await asyncio.to_thread(check.link_evidence, a, b)
+    record = await asyncio.to_thread(
+        intel_db.record_pair_verdict, a, b, verdict, note, identity["sub"], user_display, link,
+    )
+    summary = await asyncio.to_thread(_pair_verdict_summary, a, b)
+    return {"record": record, "verdict_summary": summary}
+
+
+@app.get("/api/verdicts/export")
+def api_export_verdicts(request: Request, format: str = "json") -> Response:
+    """Admin-only complete verdict history with point-in-time score snapshots."""
+    if request.state.identity.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access is required.")
+    rows = intel_db.export_pair_verdicts()
+    if format == "json":
+        return JSONResponse({"verdicts": rows})
+    if format != "csv":
+        raise HTTPException(status_code=400, detail="Choose json or csv format.")
+    output = StringIO()
+    fields = ["id", "a", "b", "verdict", "note", "user_id", "user_display", "created_at", "score", "strength", "evidence_kinds"]
+    writer = csv.DictWriter(output, fieldnames=fields)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({key: _csv_safe(value) for key, value in {
+            **row, "evidence_kinds": json.dumps(row["evidence_kinds"]),
+        }.items()})
+    return Response(
+        content=output.getvalue(), media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="pair-verdicts.csv"'},
+    )
+
+
+@app.get("/api/verdicts")
+def api_get_verdicts(a: str | None = None, b: str | None = None, domain: str | None = None) -> dict[str, Any]:
+    if domain is not None and a is None and b is None:
+        try:
+            normalized = intel_db.normalize_verdict_domain(domain)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"domain": normalized, "pairs": intel_db.verdict_summaries_for_domain(normalized)}
+    if a is None or b is None or domain is not None:
+        raise HTTPException(status_code=400, detail="Provide a and b, or one domain.")
+    try:
+        left, right = intel_db.canonical_verdict_pair(a, b)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"a": left, "b": right, **_pair_verdict_summary(left, right)}
+
 @app.post("/api/graph/connections")
 async def api_graph_connections(request: Request) -> dict[str, Any]:
     """Connections within a selected set of channels: which of them link to each
@@ -392,7 +483,16 @@ async def api_graph_connections(request: Request) -> dict[str, Any]:
     if len(domains) < 1:
         raise HTTPException(status_code=400, detail="Provide a 'domains' list.")
     pool_links = bool((payload or {}).get("pool_links"))
-    return cache.graph_connections(domains, pool_links=pool_links)
+    result = cache.graph_connections(domains, pool_links=pool_links)
+    pairs = result.get("pairs", [])
+    summaries = intel_db.verdict_summaries_for_pairs((pair["a"], pair["b"]) for pair in pairs)
+    return {
+        **result,
+        "pairs": [
+            {**pair, "verdict_summary": summaries.get(intel_db.canonical_verdict_pair(pair["a"], pair["b"]), _EMPTY_VERDICT_SUMMARY)}
+            for pair in pairs
+        ],
+    }
 
 
 @app.post("/api/graph/email")
@@ -500,7 +600,21 @@ def api_graph_links(value: str, request: Request) -> Response:
     """Ranked cross-corpus connections for an entity / registrable domain, each
     with its shared-node evidence breakdown."""
     links = cache.graph_links(value)
-    return _etag_json_response(request, {"target": value, "total": len(links), "links": links})
+    pairs = []
+    for link in links:
+        try:
+            pairs.append(intel_db.canonical_verdict_pair(value, link["target"]))
+        except ValueError:
+            pass
+    summaries = intel_db.verdict_summaries_for_pairs(pairs)
+    annotated = []
+    for link in links:
+        try:
+            key = intel_db.canonical_verdict_pair(value, link["target"])
+        except ValueError:
+            key = None
+        annotated.append({**link, "verdict_summary": summaries.get(key, _EMPTY_VERDICT_SUMMARY)})
+    return _etag_json_response(request, {"target": value, "total": len(links), "links": annotated})
 
 
 @app.get("/api/graph/link")

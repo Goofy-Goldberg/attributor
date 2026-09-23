@@ -486,6 +486,26 @@ CREATE TABLE IF NOT EXISTS graph_links (
 );
 CREATE INDEX IF NOT EXISTS idx_graph_links_rd ON graph_links(registrable_domain);
 
+-- Analyst labels are ground truth, independent of the rebuildable graph.
+-- A new row replaces a user's current opinion only in reads, never in history.
+CREATE TABLE IF NOT EXISTS pair_verdicts (
+    id               BIGSERIAL PRIMARY KEY,
+    domain_a         TEXT NOT NULL,
+    domain_b         TEXT NOT NULL,
+    verdict          TEXT NOT NULL CHECK (verdict IN ('same_owner', 'different_owner', 'unsure')),
+    note             TEXT,
+    user_id          TEXT NOT NULL,
+    user_display     TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    score            NUMERIC NOT NULL,
+    strength         TEXT NOT NULL,
+    evidence_kinds   TEXT[] NOT NULL,
+    CHECK (domain_a < domain_b)
+);
+CREATE INDEX IF NOT EXISTS idx_pair_verdicts_pair_user_latest
+    ON pair_verdicts(domain_a, domain_b, user_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_pair_verdicts_domain_b ON pair_verdicts(domain_b);
+
 -- Materialized "browse by shared edge" groups: every attributing selector (or
 -- non-noise shared IP) that ties 2+ registrable domains together, independent
 -- of the clustering fanout cap (this is enumeration, not graph unioning).
@@ -920,7 +940,7 @@ _IDENTIFIER_HANDLE_TYPES = {
 # resets (tests) drop them too; ordered so dependents precede their referents.
 _CORRELATION_TABLES = ["graph_state", "graph_links", "graph_connection_counts", "graph_selector_groups", "graph_cluster_links", "graph_clusters", "entity_edges", "observations", "selectors", "entities"]
 
-_ALL_TABLES = ["searches", *_CHILD_TABLES, "identifiers", "search_fields", *_CORRELATION_TABLES]
+_ALL_TABLES = ["searches", *_CHILD_TABLES, "identifiers", "search_fields", "pair_verdicts", *_CORRELATION_TABLES]
 
 _SCHEMA_LOCK = threading.Lock()
 _SCHEMA_READY = False
@@ -1019,6 +1039,121 @@ def reset_schema_cache() -> None:
     global _SCHEMA_READY
     with _SCHEMA_LOCK:
         _SCHEMA_READY = False
+
+
+# ── Analyst pair verdicts ────────────────────────────────────────────────────
+
+VERDICTS = frozenset({"same_owner", "different_owner", "unsure"})
+
+
+def normalize_verdict_domain(value: str) -> str:
+    """Return the registrable channel key for a hostname input."""
+    host = str(value or "").strip().lower().rstrip(".")
+    if not _HOSTNAME_RE.fullmatch(host):
+        raise ValueError("Provide a valid domain name.")
+    extractor = _tld_extractor()
+    if extractor is not None:
+        extracted = extractor(host)
+        if extracted.suffix and not extracted.domain and extracted.suffix not in _APEX_SUFFIX_OVERRIDES:
+            raise ValueError("Provide a registrable domain, not a public suffix.")
+    domain = registrable_domain(host)
+    if not domain:
+        raise ValueError("Provide a valid domain name.")
+    return domain
+
+
+def canonical_verdict_pair(a: str, b: str) -> tuple[str, str]:
+    """Normalize hostnames to two distinct, ordered graph channel keys."""
+    domains = [normalize_verdict_domain(value) for value in (a, b)]
+    if domains[0] == domains[1]:
+        raise ValueError("Choose two different channels.")
+    return tuple(sorted(domains))
+
+
+def _verdict_record(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"], "a": row["domain_a"], "b": row["domain_b"],
+        "verdict": row["verdict"], "note": row["note"],
+        "user_id": row["user_id"], "user_display": row["user_display"],
+        "created_at": row["created_at"].isoformat(),
+        "score": float(row["score"]), "strength": row["strength"],
+        "evidence_kinds": list(row["evidence_kinds"]),
+    }
+
+
+def record_pair_verdict(
+    a: str, b: str, verdict: str, note: str | None, user_id: str,
+    user_display: str | None, link: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Append one judgement with the score as it stood when submitted."""
+    domain_a, domain_b = canonical_verdict_pair(a, b)
+    if not isinstance(verdict, str) or verdict not in VERDICTS:
+        raise ValueError("Choose same owner, different owner, or unsure.")
+    kinds = sorted({str(item["kind"]) for item in link.get("evidence", []) if item.get("kind")})
+    init_db()
+    with _conn() as c:
+        row = c.execute(
+            """INSERT INTO pair_verdicts
+               (domain_a, domain_b, verdict, note, user_id, user_display, score, strength, evidence_kinds)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+               RETURNING *""",
+            (domain_a, domain_b, verdict, note, user_id, user_display,
+             float(link.get("score") or 0), str(link.get("strength") or "weak"), kinds),
+        ).fetchone()
+    return _verdict_record(row)
+
+
+def _verdict_summary(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    verdicts = [_verdict_record(row) for row in rows]
+    counts = {verdict: sum(row["verdict"] == verdict for row in verdicts) for verdict in sorted(VERDICTS)}
+    return {"counts": counts, "verdicts": verdicts}
+
+
+def verdict_summaries_for_pairs(pairs: Iterable[tuple[str, str]]) -> dict[tuple[str, str], dict[str, Any]]:
+    """Fetch each user's latest verdict for the requested pairs in one read."""
+    keys = sorted({canonical_verdict_pair(a, b) for a, b in pairs})
+    if not keys:
+        return {}
+    init_db()
+    placeholders = ", ".join(["(%s, %s)"] * len(keys))
+    with _conn() as c:
+        rows = c.execute(
+            f"""SELECT DISTINCT ON (domain_a, domain_b, user_id) *
+                FROM pair_verdicts WHERE (domain_a, domain_b) IN ({placeholders})
+                ORDER BY domain_a, domain_b, user_id, id DESC""",
+            tuple(value for pair in keys for value in pair),
+        ).fetchall()
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[(row["domain_a"], row["domain_b"])].append(row)
+    return {key: _verdict_summary(grouped[key]) for key in keys}
+
+
+def verdict_summaries_for_domain(domain: str) -> list[dict[str, Any]]:
+    """Every labelled pair containing a channel, including unlinked pairs."""
+    init_db()
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT DISTINCT ON (domain_a, domain_b, user_id) * FROM pair_verdicts
+               WHERE domain_a = %s OR domain_b = %s
+               ORDER BY domain_a, domain_b, user_id, id DESC""",
+            (domain, domain),
+        ).fetchall()
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[(row["domain_a"], row["domain_b"])].append(row)
+    return [
+        {"a": a, "b": b, "verdict_summary": _verdict_summary(group)}
+        for (a, b), group in sorted(grouped.items())
+    ]
+
+
+def export_pair_verdicts() -> list[dict[str, Any]]:
+    """Return the full append-only history for calibration exports."""
+    init_db()
+    with _conn() as c:
+        rows = c.execute("SELECT * FROM pair_verdicts ORDER BY id").fetchall()
+    return [_verdict_record(row) for row in rows]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

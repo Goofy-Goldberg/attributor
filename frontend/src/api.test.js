@@ -14,6 +14,7 @@ import {
   normalizeSearchResults,
   normalizeSelectorGroups,
   normalizeSelectorKinds,
+  normalizeVerdictSummary,
 } from "./api.js";
 
 describe("API payload normalizers", () => {
@@ -86,6 +87,35 @@ describe("API payload normalizers", () => {
     });
     expect(confidenceFromScore(65)).toBe(50);
     expect(confidenceFromScore("bad")).toBe(0);
+  });
+
+  it("normalizes embedded and endpoint verdict summaries", () => {
+    const summary = normalizeVerdictSummary({
+      summary: {
+        counts: { same_owner: "2", differentOwner: 1 },
+        verdicts: [
+          {
+            verdict_id: "v1",
+            user_id: "u1",
+            user_display: "Ada",
+            verdict: "same_owner",
+            note: "Shared registration ID.",
+            created_at: "2026-09-23T10:00:00Z",
+            evidence_kinds: ["legal_registration"],
+          },
+          { verdict: "invalid" },
+        ],
+      },
+    });
+
+    expect(summary).toEqual({
+      counts: { same_owner: 2, different_owner: 1, unsure: 0 },
+      verdicts: [
+        expect.objectContaining({ id: "v1", userId: "u1", userDisplay: "Ada", verdict: "same_owner", evidenceKinds: ["legal_registration"] }),
+      ],
+    });
+
+    expect(normalizeGraphLinks({ links: [{ target: "beta.example", verdict_summary: summary }] })[0].verdictSummary).toEqual(summary);
   });
 
   it("normalizes pools, clusters, selectors, and search results from API field variants", () => {

@@ -24,8 +24,9 @@ an authorization check. Direct requests to port 9000 are checked too.
   identities by Mattermost's stable user ID; a matching email alone does not
   merge accounts. A signed-in user can choose **Connect Mattermost** from the
   account menu to link the two methods.
-- Regular users can browse, compare, and start scans. Admins can also use
-  graph recompute and graph email. Both actions are checked in FastAPI. New
+- Regular users can browse, compare, start scans, and record pair verdicts.
+  Admins can also use graph recompute, graph email, and export the full verdict
+  history from `/api/verdicts/export`. These permissions are checked in FastAPI. New
   accounts always have the regular `user` role.
 
 After an account has signed in once, assign or remove admin access with:

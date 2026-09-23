@@ -41,6 +41,30 @@ function describeLink(link, leftLabel, rightLabel) {
   return `${leftLabel} and ${rightLabel} share evidence (${strength.label.toLowerCase()} evidence, match score ${Math.round(link.score ?? 0)})${evidenceText}.`;
 }
 
+export function describeVerdictSummary(summary) {
+  const counts = summary?.counts || {};
+  const labels = [
+    ["same_owner", "Same owner"],
+    ["different_owner", "Different owner"],
+    ["unsure", "Unsure"],
+  ].filter(([value]) => counts[value] > 0);
+  if (labels.length === 0) {
+    return "";
+  }
+  const text = labels.map(([value, label]) => `${label}: ${counts[value]}`).join(", ");
+  return labels.length > 1 ? `Analysts disagree (${text}).` : `Analyst verdict: ${text}.`;
+}
+
+function verdictDetails(summary) {
+  return (summary?.verdicts || [])
+    .map((entry) => {
+      const name = entry.userDisplay || entry.userId || "Analyst";
+      const label = entry.verdict === "same_owner" ? "Same owner" : entry.verdict === "different_owner" ? "Different owner" : "Unsure";
+      return `${name}: ${label}${entry.note ? ` — ${entry.note}` : ""}`;
+    })
+    .join("; ");
+}
+
 // Each score describes one pairwise match in the chain, not the endpoints.
 function describeChainLines(chain) {
   return (chain || []).map((hop) => {
@@ -76,6 +100,16 @@ export function buildReportHtml(scope) {
     })
     .join("\n");
 
+  const verdictRows = pairs
+    .flatMap((pair) => {
+      if (!describeVerdictSummary(pair.verdictSummary)) {
+        return [];
+      }
+      const details = verdictDetails(pair.verdictSummary);
+      return [`<li><strong>${escapeHtml(pair.a)} ↔ ${escapeHtml(pair.b)}</strong>: ${escapeHtml(describeVerdictSummary(pair.verdictSummary))}${details ? `<br />${escapeHtml(details)}` : ""}</li>`];
+    })
+    .join("\n");
+
   return `<!doctype html>
 <html>
 <head>
@@ -104,6 +138,8 @@ export function buildReportHtml(scope) {
 
   <h2>Direct connections (${connectedPairs.length})</h2>
   ${connectedPairs.length > 0 ? `<ul>${pairSentences}</ul>` : "<p>No direct evidence-backed connections among these channels.</p>"}
+
+  ${verdictRows ? `<h2>Analyst verdicts</h2><p>Each analyst's assessment is retained. More than one verdict type means analysts disagree.</p><ul>${verdictRows}</ul>` : ""}
 
   ${chainSections ? `<h2>Multi-hop relationships</h2><p>Each step is a separate match between two channels. A chain describes an indirect path; it does not give one match score for its endpoints.</p>${chainSections}` : ""}
 </body>
@@ -148,7 +184,19 @@ const CSV_HEADER = [
   "strength",
   "shared_node_kind",
   "shared_node_value",
+  "same_owner_verdicts",
+  "different_owner_verdicts",
+  "unsure_verdicts",
+  "analyst_verdicts",
 ];
+
+function verdictCsvFields(summary) {
+  if (!describeVerdictSummary(summary)) {
+    return ["", "", "", ""];
+  }
+  const counts = summary?.counts || {};
+  return [counts.same_owner ?? 0, counts.different_owner ?? 0, counts.unsure ?? 0, verdictDetails(summary)];
+}
 
 // One row per shared-evidence item (a pair with 3 shared selectors becomes 3
 // rows); a connected pair with no evidence rows (e.g. inferred-only) still
@@ -158,12 +206,12 @@ export function buildReportCsv(scope) {
   const rows = [CSV_HEADER.join(",")];
 
   pairs
-    .filter((pair) => pair.connected)
+    .filter((pair) => pair.connected || describeVerdictSummary(pair.verdictSummary))
     .forEach((pair) => {
       const evidence = pair.evidence || [];
       if (evidence.length === 0) {
         rows.push(
-          [pair.a, pair.b, 1, Math.round(pair.score ?? 0), pair.confidence ?? "", pair.strength ?? "", "", ""]
+          [pair.a, pair.b, 1, Math.round(pair.score ?? 0), pair.confidence ?? "", pair.strength ?? "", "", "", ...verdictCsvFields(pair.verdictSummary)]
             .map(csvField)
             .join(","),
         );
@@ -171,7 +219,7 @@ export function buildReportCsv(scope) {
       }
       evidence.forEach((node) => {
         rows.push(
-          [pair.a, pair.b, 1, Math.round(pair.score ?? 0), pair.confidence ?? "", pair.strength ?? "", node.kind, node.value]
+          [pair.a, pair.b, 1, Math.round(pair.score ?? 0), pair.confidence ?? "", pair.strength ?? "", node.kind, node.value, ...verdictCsvFields(pair.verdictSummary)]
             .map(csvField)
             .join(","),
         );
@@ -183,7 +231,7 @@ export function buildReportCsv(scope) {
       const evidence = hop.evidence && hop.evidence.length > 0 ? hop.evidence : [{ kind: "", value: "" }];
       evidence.forEach((node) => {
         rows.push(
-          [entry.a, entry.b, entry.hops, Math.round(hop.score ?? 0), hop.confidence ?? "", hop.strength ?? "", node.kind, node.value]
+          [entry.a, entry.b, entry.hops, Math.round(hop.score ?? 0), hop.confidence ?? "", hop.strength ?? "", node.kind, node.value, ...verdictCsvFields(hop.verdictSummary)]
             .map(csvField)
             .join(","),
         );

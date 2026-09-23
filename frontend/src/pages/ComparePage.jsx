@@ -31,6 +31,10 @@ function domainKey(value) {
   return String(value || "").trim().toLowerCase().replace(/\.$/, "");
 }
 
+function pairVerdictKey(a, b) {
+  return domainKey(a) < domainKey(b) ? `${domainKey(a)}\u0000${domainKey(b)}` : `${domainKey(b)}\u0000${domainKey(a)}`;
+}
+
 export default function ComparePage() {
   const [params, setParams] = useSearchParams();
   const selected = useMemo(() => [...new Set(params.getAll("d").filter(Boolean))], [params]);
@@ -60,7 +64,18 @@ export default function ComparePage() {
     return () => window.clearTimeout(handle);
   }, [run, selected.length]);
 
-  const pairs = useMemo(() => normalizeConnectionPairs(result), [result]);
+  const [savedVerdicts, setSavedVerdicts] = useState(new Map());
+  const pairs = useMemo(
+    () =>
+      normalizeConnectionPairs(result).map((pair) => ({
+        ...pair,
+        verdictSummary: savedVerdicts.get(pairVerdictKey(pair.a, pair.b)) || pair.verdictSummary,
+      })),
+    [result, savedVerdicts],
+  );
+  const handleVerdictSaved = useCallback(({ a, b, summary }) => {
+    setSavedVerdicts((current) => new Map(current).set(pairVerdictKey(a, b), summary));
+  }, []);
   const explorerGraph = useMemo(() => normalizeExplorerGraph(result, relatedChains), [result, relatedChains]);
   const seedSet = useMemo(() => new Set(seedDomains), [seedDomains]);
   const scoredDomains = result?.domains || [];
@@ -168,7 +183,7 @@ export default function ComparePage() {
             </TabsList>
             {seedDomains.length >= 2 ? (
               <TabsContent className="pt-4" value="pairs">
-                <PairsPanel expandedCount={expandedCount} pairs={pairs} seedSet={seedSet} />
+                <PairsPanel expandedCount={expandedCount} onVerdictSaved={handleVerdictSaved} pairs={pairs} seedSet={seedSet} />
               </TabsContent>
             ) : null}
             <TabsContent className="pt-4" value="map">
@@ -242,7 +257,7 @@ function Verdict({ pairs, seedSet, expandedCount }) {
   );
 }
 
-function PairsPanel({ pairs, seedSet, expandedCount }) {
+export function PairsPanel({ pairs, seedSet, expandedCount, onVerdictSaved }) {
   const [scope, setScope] = useState("selected");
   const inScope = pairs.filter((pair) => scope === "all" || (seedSet.has(pair.a) && seedSet.has(pair.b)));
   const connected = inScope.filter((pair) => pair.connected).sort((a, b) => (b.score || 0) - (a.score || 0));
@@ -258,7 +273,7 @@ function PairsPanel({ pairs, seedSet, expandedCount }) {
           </ToggleGroup>
         ) : null
       }
-      description="Open a pair to see the shared evidence behind its score."
+      description="Open any pair to review its evidence and record an assessment."
       title={`${connected.length} connected pair${connected.length === 1 ? "" : "s"}`}
     >
       {connected.length === 0 ? (
@@ -266,15 +281,17 @@ function PairsPanel({ pairs, seedSet, expandedCount }) {
       ) : (
         <div className="flex flex-col gap-2">
           {connected.map((pair) => (
-            <ConnectionRow key={`${pair.a}|${pair.b}`} leftLabel={pair.a} link={pair} rightLabel={pair.b} showPair />
+            <ConnectionRow key={`${pair.a}|${pair.b}`} leftLabel={pair.a} link={pair} onVerdictSaved={onVerdictSaved} rightLabel={pair.b} showPair />
           ))}
         </div>
       )}
       {unconnected.length > 0 ? (
-        <p className="text-muted-foreground text-sm">
-          Not connected: {unconnected.slice(0, 12).map((pair) => `${pair.a} ↔ ${pair.b}`).join(", ")}
-          {unconnected.length > 12 ? ` and ${unconnected.length - 12} more` : ""}.
-        </p>
+        <div className="flex flex-col gap-2">
+          <p className="text-muted-foreground text-sm">No shared evidence ({unconnected.length})</p>
+          {unconnected.map((pair) => (
+            <ConnectionRow key={`${pair.a}|${pair.b}`} leftLabel={pair.a} link={pair} onVerdictSaved={onVerdictSaved} rightLabel={pair.b} showPair />
+          ))}
+        </div>
       ) : null}
     </Section>
   );

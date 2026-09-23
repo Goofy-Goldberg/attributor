@@ -256,6 +256,11 @@ def test_domain_endpoint_404(monkeypatch) -> None:
 
 def test_connections_among_endpoint(monkeypatch) -> None:
     _quiet(monkeypatch)
+    monkeypatch.setattr(case_app.intel_db, "verdict_summaries_for_pairs", lambda pairs: {
+        ("a.com", "b.com"): {
+            "counts": {"same_owner": 2, "different_owner": 1, "unsure": 0}, "verdicts": [],
+        }
+    })
     captured: dict = {}
 
     def _connections(domains, *, pool_links=False, **_):
@@ -274,6 +279,9 @@ def test_connections_among_endpoint(monkeypatch) -> None:
     body = response.json()
     assert body["connected_pair_count"] == 1
     assert captured["domains"] == ["a.com", "b.com"]
+    assert body["pairs"][0]["verdict_summary"]["counts"] == {
+        "same_owner": 2, "different_owner": 1, "unsure": 0,
+    }
 
 
 def test_connections_requires_domains(monkeypatch) -> None:
@@ -315,6 +323,11 @@ def test_selector_kinds_endpoint(monkeypatch) -> None:
 
 def test_graph_links_endpoint(monkeypatch) -> None:
     _quiet(monkeypatch)
+    monkeypatch.setattr(case_app.intel_db, "verdict_summaries_for_pairs", lambda pairs: {
+        ("a.com", "b.com"): {
+            "counts": {"same_owner": 2, "different_owner": 1, "unsure": 0}, "verdicts": [],
+        }
+    })
     monkeypatch.setattr(
         case_app.check,
         "links_for",
@@ -329,6 +342,74 @@ def test_graph_links_endpoint(monkeypatch) -> None:
     body = response.json()
     assert body["target"] == "a.com"
     assert body["links"][0]["target"] == "b.com"
+    assert body["links"][0]["verdict_summary"]["counts"]["same_owner"] == 2
+
+
+def test_verdict_routes_use_verified_identity_and_server_score(monkeypatch) -> None:
+    _quiet(monkeypatch, authenticated=False)
+    headers = _auth_headers(monkeypatch)
+    captured = {}
+    summary = {"counts": {"same_owner": 1, "different_owner": 0, "unsure": 0}, "verdicts": []}
+    monkeypatch.setattr(case_app.check, "link_evidence", lambda a, b: {
+        "score": 42.5, "strength": "moderate", "evidence": [{"kind": "shared_ip"}],
+    })
+
+    def _record(a, b, verdict, note, user_id, user_display, link):
+        captured.update(a=a, b=b, verdict=verdict, note=note, user_id=user_id,
+                        user_display=user_display, link=link)
+        return {"id": 1, "verdict": verdict}
+
+    monkeypatch.setattr(case_app.intel_db, "record_pair_verdict", _record)
+    monkeypatch.setattr(case_app.intel_db, "verdict_summaries_for_pairs", lambda pairs: {("a.com", "b.com"): summary})
+    monkeypatch.setattr(case_app.intel_db, "verdict_summaries_for_domain", lambda domain: [
+        {"a": "a.com", "b": "b.com", "verdict_summary": summary}
+    ])
+    with TestClient(case_app.app) as client:
+        response = client.put("/api/verdicts", headers=headers, json={
+            "a": "WWW.B.COM", "b": "a.com", "verdict": "same_owner", "note": "  legal page  ",
+            "score": 9999, "evidence_kinds": ["made_up"],
+        })
+        pair = client.get("/api/verdicts", headers=headers, params={"a": "b.com", "b": "a.com"})
+        domain = client.get("/api/verdicts", headers=headers, params={"domain": "www.b.com"})
+    assert response.status_code == 200
+    assert captured == {
+        "a": "a.com", "b": "b.com", "verdict": "same_owner", "note": "legal page",
+        "user_id": "test-user", "user_display": None,
+        "link": {"score": 42.5, "strength": "moderate", "evidence": [{"kind": "shared_ip"}]},
+    }
+    assert pair.json()["counts"]["same_owner"] == 1
+    assert domain.json()["pairs"][0]["verdict_summary"] == summary
+
+
+def test_verdict_export_requires_admin_and_includes_snapshots(monkeypatch) -> None:
+    _quiet(monkeypatch, authenticated=False)
+    user_headers = _auth_headers(monkeypatch)
+    monkeypatch.setattr(case_app.intel_db, "export_pair_verdicts", lambda: [{
+        "id": 7, "a": "a.com", "b": "b.com", "verdict": "different_owner",
+        "note": "=1+1", "user_id": "analyst-1", "user_display": "A",
+        "created_at": "2026-09-23T12:00:00+00:00", "score": 40.0,
+        "strength": "moderate", "evidence_kinds": ["shared_ip", "tls_spki"],
+    }])
+    with TestClient(case_app.app) as client:
+        assert client.get("/api/verdicts/export", headers=user_headers).status_code == 403
+        admin_headers = _auth_headers(monkeypatch, role="admin")
+        response = client.get("/api/verdicts/export", headers=admin_headers)
+        csv_response = client.get("/api/verdicts/export", headers=admin_headers, params={"format": "csv"})
+    assert response.status_code == 200
+    assert response.json()["verdicts"][0]["score"] == 40.0
+    assert csv_response.status_code == 200
+    assert '"[""shared_ip"", ""tls_spki""]"' in csv_response.text
+    assert "'=1+1" in csv_response.text
+
+
+def test_verdict_rejects_same_channel_and_invalid_values(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    with TestClient(case_app.app) as client:
+        assert client.put("/api/verdicts", json={"a": "www.a.com", "b": "a.com", "verdict": "unsure"}).status_code == 400
+        assert client.put("/api/verdicts", json={"a": "a.com", "b": "b.com", "verdict": "maybe"}).status_code == 400
+        assert client.put("/api/verdicts", json={"a": "a.com", "b": "b.com", "verdict": ["unsure"]}).status_code == 400
+        assert client.get("/api/verdicts", params={"domain": "https://a.com"}).status_code == 400
+        assert client.get("/api/verdicts", params={"domain": "co.uk"}).status_code == 400
 
 
 def test_graph_link_pair_endpoint(monkeypatch) -> None:
