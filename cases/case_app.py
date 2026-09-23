@@ -523,13 +523,31 @@ async def api_graph_connections(request: Request) -> dict[str, Any]:
     pool_links = bool((payload or {}).get("pool_links"))
     result = cache.graph_connections(domains, pool_links=pool_links)
     pairs = result.get("pairs", [])
-    summaries = intel_db.verdict_summaries_for_pairs((pair["a"], pair["b"]) for pair in pairs)
+    pool = result.get("pool_links") or {}
+    verdict_pairs = [(pair["a"], pair["b"]) for pair in pairs]
+    for domain, links in pool.items():
+        for link in links or []:
+            if link.get("target"):
+                verdict_pairs.append((domain, link["target"]))
+    summaries = intel_db.verdict_summaries_for_pairs(verdict_pairs)
+
+    def summary_for(a: str, b: str) -> dict[str, Any]:
+        try:
+            key = intel_db.canonical_verdict_pair(a, b)
+        except ValueError:
+            return _EMPTY_VERDICT_SUMMARY
+        return summaries.get(key, _EMPTY_VERDICT_SUMMARY)
+
     return {
         **result,
         "pairs": [
-            {**pair, "verdict_summary": summaries.get(intel_db.canonical_verdict_pair(pair["a"], pair["b"]), _EMPTY_VERDICT_SUMMARY)}
+            {**pair, "verdict_summary": summary_for(pair["a"], pair["b"])}
             for pair in pairs
         ],
+        **({"pool_links": {
+            domain: [{**link, "verdict_summary": summary_for(domain, link["target"])} for link in links or []]
+            for domain, links in pool.items()
+        }} if pool_links else {}),
     }
 
 
@@ -634,10 +652,18 @@ async def api_favicon_image(kind: str, value: str) -> Response:
 
 
 @app.get("/api/graph/links/{value:path}")
-def api_graph_links(value: str, request: Request) -> Response:
+def api_graph_links(value: str, request: Request, limit: int = 50) -> Response:
     """Ranked cross-corpus connections for an entity / registrable domain, each
     with its shared-node evidence breakdown."""
-    links = cache.graph_links(value)
+    page = cache.graph_links(value, limit=limit)
+    # Older cache entries were a bare list. Treating those as a completed page
+    # avoids a transient server error during a rolling upgrade, while fresh
+    # entries always carry the honest total and truncation state.
+    if isinstance(page, list):
+        links = page
+        page = {"links": links, "total": len(links), "limit": len(links), "has_more": False}
+    else:
+        links = page.get("links", [])
     pairs = []
     for link in links:
         try:
@@ -652,7 +678,13 @@ def api_graph_links(value: str, request: Request) -> Response:
         except ValueError:
             key = None
         annotated.append({**link, "verdict_summary": summaries.get(key, _EMPTY_VERDICT_SUMMARY)})
-    return _etag_json_response(request, {"target": value, "total": len(links), "links": annotated})
+    return _etag_json_response(request, {
+        "target": value,
+        "total": page.get("total", len(links)),
+        "limit": page.get("limit", len(links)),
+        "has_more": bool(page.get("has_more")),
+        "links": annotated,
+    })
 
 
 @app.get("/api/graph/link")
@@ -673,16 +705,25 @@ def api_graph_path(a: str, b: str, request: Request) -> Response:
         raise HTTPException(status_code=400, detail="Provide both 'a' and 'b' query parameters.")
     path = intel_db.path_between(a, b)
     if path is None:
-        raise HTTPException(status_code=404, detail="No precomputed path within the configured hop limit.")
+        status = intel_db.path_status_for(a)
+        detail = "No precomputed path within the configured hop limit."
+        if status and status.get("partial"):
+            detail += " The source traversal reached a search limit, so this is not proof that no longer path exists."
+        if status and status.get("stale"):
+            detail += " The path index is waiting for its next rebuild, so newer connections may not be represented yet."
+        raise HTTPException(status_code=404, detail=detail)
     return _etag_json_response(request, {"path": path})
 
 
 @app.get("/api/graph/related/{value:path}")
-def api_graph_related(value: str, request: Request, max_hops: int | None = None, limit: int = 50) -> Response:
+def api_graph_related(value: str, request: Request, max_hops: int | None = None, min_hops: int | None = None, limit: int = 50) -> Response:
     """A channel's precomputed multi-hop neighborhood (direct links plus
     everything reachable through an intermediary), strongest/shortest first."""
-    related = intel_db.related_through(value, max_hops=max_hops, limit=limit)
-    return _etag_json_response(request, {"target": value, "total": len(related), "related": related})
+    kwargs = {"max_hops": max_hops, "limit": limit}
+    if min_hops is not None:
+        kwargs["min_hops"] = min_hops
+    page = intel_db.related_through_page(value, **kwargs)
+    return _etag_json_response(request, {"target": value, **page})
 
 
 @app.get("/api/search")
@@ -725,7 +766,12 @@ def api_list_jobs(status: str, limit: int | None = None) -> dict[str, Any]:
     requested_limit = default_limit if limit is None else limit
     if not 1 <= requested_limit <= max_limit:
         raise HTTPException(status_code=422, detail=f"limit must be between 1 and {max_limit} for {status} jobs.")
-    return {"jobs": list_jobs(status=status, limit=requested_limit)}
+    return {
+        "jobs": [
+            build_job_response(job)
+            for job in list_jobs(status=status, limit=requested_limit)
+        ]
+    }
 
 
 @app.get("/api/jobs/{job_id}")

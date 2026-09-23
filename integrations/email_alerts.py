@@ -225,7 +225,12 @@ def send_case_email(case: Mapping[str, Any], job: Mapping[str, Any]) -> bool:
     targets = _safe_list(case.get("targets"))
     target_count = case.get("total_targets") or summary.get("target_count") or len(targets)
     successful = case.get("successful_targets")
+    partial = case.get("partial_targets") or job.get("partial_targets") or 0
     failed = case.get("failed_targets")
+    coverage = _safe_dict(summary.get("provider_coverage"))
+    provider_rows = _safe_list(coverage.get("providers"))
+    provider_failures = sum(len(_safe_list(row.get("failed"))) for row in provider_rows if isinstance(row, Mapping))
+    provider_skips = sum(len(_safe_list(row.get("skipped"))) for row in provider_rows if isinstance(row, Mapping))
 
     base_url = os.getenv("APP_BASE_URL", "").rstrip("/")
     first_target = str(targets[0]) if targets else None
@@ -244,8 +249,10 @@ def send_case_email(case: Mapping[str, Any], job: Mapping[str, Any]) -> bool:
 
     details: dict[str, Any] = {
         "Submitted": target_count or 0,
-        "Succeeded": successful or 0,
+        "Persisted": successful or 0,
+        "Partial": partial,
         "Failed": failed or 0,
+        "Provider coverage": f"{provider_failures} failed, {provider_skips} skipped",
         "Pool connections found": len(top_findings),
         "Top findings": highlights,
         "Summary": summary_url,
@@ -253,6 +260,8 @@ def send_case_email(case: Mapping[str, Any], job: Mapping[str, Any]) -> bool:
 
     if status == "failed":
         text = f"Case {case_id or 'unknown'} failed."
+    elif status == "partial":
+        text = f"Case {case_id or 'unknown'} completed with partial provider coverage."
     else:
         text = f"Case {case_id or 'unknown'} completed."
 

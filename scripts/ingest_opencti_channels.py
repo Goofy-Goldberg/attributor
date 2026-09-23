@@ -246,6 +246,7 @@ def main() -> None:
     total_attached = 0
     total_missing = 0
     failed_batches = 0
+    partial_batches = 0
 
     for batch_num, batch_inputs in enumerate(batches, 1):
         print(
@@ -255,6 +256,8 @@ def main() -> None:
         status = _run_batch(runtime, batch_inputs, poll_interval=args.poll_interval)
         if status == "failed":
             failed_batches += 1
+        elif status == "partial":
+            partial_batches += 1
 
         attached, missing = _attach_labels(batch_inputs, normalized_labels)
         total_attached += attached
@@ -262,8 +265,8 @@ def main() -> None:
         print(f"  attached labels to {attached} domain(s); {missing} had labels but no matching search result.")
 
     print(
-        f"\nAll batches done: {len(batches) - failed_batches}/{len(batches)} completed, "
-        f"{failed_batches} failed. Attached labels to {total_attached} domain(s) "
+        f"\nAll batches done: {len(batches) - partial_batches - failed_batches}/{len(batches)} completed, "
+        f"{partial_batches} partial, {failed_batches} failed. Attached labels to {total_attached} domain(s) "
         f"({total_missing} unmatched)."
     )
 
@@ -271,16 +274,16 @@ def main() -> None:
     graph_counts = rebuild_clusters()
     print(f"  graph rebuild: {graph_counts}")
 
-    if failed_batches:
+    if failed_batches or partial_batches:
         sys.exit(1)
 
 
 def _run_batch(runtime: CaseRuntime, batch_inputs: list, *, poll_interval: float) -> str:
     """Submit one batch as a case and block until it finishes, printing progress.
 
-    Returns the job's terminal status ("completed" or "failed"). A failed batch
-    does not abort the sweep — the remaining batches still run, and the caller
-    reports the overall tally at the end.
+    Returns the job's terminal status ("completed", "partial", or "failed").
+    A partial or failed batch does not abort the sweep. The caller reports
+    separate totals at the end.
     """
     identifiers = runtime.submit_case(batch_inputs, input_mode="opencti_website_full")
     case_id, job_id = identifiers["case_id"], identifiers["job_id"]
@@ -298,7 +301,7 @@ def _run_batch(runtime: CaseRuntime, batch_inputs: list, *, poll_interval: float
         if signature != last_signature:
             _print_progress(job)
             last_signature = signature
-        if job.get("status") in ("completed", "failed"):
+        if job.get("status") in ("completed", "partial", "failed"):
             break
         time.sleep(poll_interval)
 

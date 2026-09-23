@@ -379,8 +379,14 @@ def domain_profile(value: str) -> dict[str, Any] | None:
     return cached("domain", {"value": value}, lambda: intel_db.domain_profile(value))
 
 
-def graph_links(value: str) -> list[dict[str, Any]]:
-    return cached("links", {"value": value}, lambda: check.links_for(value))
+def graph_links(value: str, *, limit: int = 50) -> dict[str, Any]:
+    """One explicit page of direct links, including the true matching total."""
+    safe_limit = max(1, min(int(limit), 100))
+    return cached(
+        "links",
+        {"value": value, "limit": safe_limit},
+        lambda: check.links_for_fast_page(value, limit=safe_limit),
+    )
 
 
 def graph_connections(domains: list[str], *, pool_links: bool = False) -> dict[str, Any]:

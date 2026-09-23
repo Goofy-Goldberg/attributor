@@ -464,8 +464,17 @@ def _score_selector_row(row: dict, cert_meta: dict[str, dict] | None = None) -> 
         default=None,
     )
     recency = recency_weight(most_recent)
-    weight = base * rarity * overlap * recency
     sources = sorted({s for s in (list(row.get("a_sources") or []) + list(row.get("b_sources") or [])) if s})
+    ct_date_unknown = (
+        kind == "tls_san"
+        and sources == ["crtsh"]
+        and (not row.get("a_last") or not row.get("b_last"))
+    )
+    if ct_date_unknown:
+        # Retrieval and validity dates do not show that the site served the
+        # cert. Unknown CT dates receive the existing freshness floor.
+        recency = min(recency, _RECENCY_FLOOR)
+    weight = base * rarity * overlap * recency
     # `tracking_id`/`site_verification`/`social_handle`/`crypto_wallet` values are
     # "<provider>|<id>"; expose the provider so the UI can label e.g. an AdSense
     # account distinctly from a reused GTM container, a Google vs. Yandex
@@ -476,6 +485,8 @@ def _score_selector_row(row: dict, cert_meta: dict[str, dict] | None = None) -> 
     degradation = _degradation_note(degree, rarity, recency, most_recent)
     if degradation:
         explanation = f"{explanation} {degradation}" if explanation else degradation
+    if ct_date_unknown:
+        explanation = f"{explanation} The CT source date is unavailable, so freshness receives minimum credit."
     # Real certificate metadata (CN, issuer, actual CA-issued validity window)
     # for tls_cert_sha256 matches — the full "why" an OSINT investigator needs
     # for a cert match, not just that the fingerprint is identical. Keyed by
@@ -498,7 +509,7 @@ def _score_selector_row(row: dict, cert_meta: dict[str, dict] | None = None) -> 
         "rarity": round(rarity, 3),
         "time_overlap": round(overlap, 3),
         "recency": round(recency, 3),
-        "degraded": bool(degradation),
+        "degraded": bool(degradation or ct_date_unknown),
         "weight": round(weight, 2),
         "sources": sources,
         # Certificate identity/validity, only populated for tls_cert_sha256
@@ -959,6 +970,30 @@ def link_evidence(a_value: str, b_value: str) -> dict:
     return link
 
 
+_GRAPH_LINK_PAGE_DEFAULT = 50
+_GRAPH_LINK_PAGE_MAX = 100
+
+
+def _page_limit(limit: int | None) -> int:
+    """Clamp public link pages while retaining the full scoring result internally."""
+    try:
+        requested = _GRAPH_LINK_PAGE_DEFAULT if limit is None else int(limit)
+    except (TypeError, ValueError):
+        requested = _GRAPH_LINK_PAGE_DEFAULT
+    return max(1, min(requested, _GRAPH_LINK_PAGE_MAX))
+
+
+def _link_page(links: list[dict], limit: int | None) -> dict:
+    safe_limit = _page_limit(limit)
+    total = len(links)
+    return {
+        "links": links[:safe_limit],
+        "total": total,
+        "limit": safe_limit,
+        "has_more": total > safe_limit,
+    }
+
+
 def connections_among(
     domains: list[str], *, pool_links: bool = False, max_domains: int = 30
 ) -> dict:
@@ -970,16 +1005,16 @@ def connections_among(
     """
     from db import intel_db
 
-    resolved: list[str] = []
+    resolved_all: list[str] = []
     seen: set[str] = set()
     for value in domains:
         side = intel_db._resolve_side(value)
         if not side or side[1] in seen:
             continue
         seen.add(side[1])
-        resolved.append(side[1])
-        if len(resolved) >= max_domains:
-            break
+        resolved_all.append(side[1])
+    safe_max_domains = max(1, min(int(max_domains or 30), 100))
+    resolved = resolved_all[:safe_max_domains]
 
     # Each member's own precomputed connection list (links_for_fast — cached
     # by rebuild_clusters, live-fallback for anything not yet rebuilt), fetched
@@ -1021,15 +1056,22 @@ def connections_among(
         "domains": resolved,
         "pairs": pairs,
         "connected_pair_count": sum(1 for link in pairs if link["connected"]),
+        "submitted_domain_count": len(resolved_all),
+        "selection_limit": safe_max_domains,
+        "selection_truncated": len(resolved_all) > len(resolved),
     }
     tier_domains = set(resolved)
     if pool_links:
-        # Same shape as links_for's own default (limit=50, min_score=1) — reuses
-        # the fetch above instead of a second cache/DB read per domain. No
-        # artificial cap beyond that: the frontend already previews only the
-        # top few and needs the true length to report an accurate count.
-        result["pool_links"] = {
-            d: [link for link in all_candidates[d] if link["score"] >= 1.0][:50] for d in resolved
+        # The graph needs a bounded payload, but the caller also gets the exact
+        # total per domain so a 50-row page can never read as "50 connections".
+        pool_pages = {
+            d: _link_page([link for link in all_candidates[d] if link["score"] >= 1.0], _GRAPH_LINK_PAGE_DEFAULT)
+            for d in resolved
+        }
+        result["pool_links"] = {domain: page["links"] for domain, page in pool_pages.items()}
+        result["pool_link_meta"] = {
+            domain: {key: page[key] for key in ("total", "limit", "has_more")}
+            for domain, page in pool_pages.items()
         }
         for links in result["pool_links"].values():
             tier_domains.update(link.get("target") for link in links if link.get("target"))
@@ -1037,7 +1079,7 @@ def connections_among(
     return result
 
 
-def links_for(value: str, *, limit: int | None = 50, min_score: float = 1.0) -> list[dict]:
+def _ranked_links(value: str, *, min_score: float = 1.0) -> list[dict]:
     """Ranked cross-corpus connections for one entity / registrable domain.
 
     Candidates whose only shared nodes are non-attributing fall out for free:
@@ -1077,7 +1119,23 @@ def links_for(value: str, *, limit: int | None = 50, min_score: float = 1.0) -> 
         link["registrable_domain"] = rd
         results.append(link)
     results.sort(key=lambda link: link["score"], reverse=True)
-    return results[:limit] if limit else results
+    return results
+
+
+def links_for_page(value: str, *, limit: int | None = _GRAPH_LINK_PAGE_DEFAULT, min_score: float = 1.0) -> dict:
+    """A bounded page of direct links with an honest total and truncation flag."""
+    return _link_page(_ranked_links(value, min_score=min_score), limit)
+
+
+def links_for(value: str, *, limit: int | None = 50, min_score: float = 1.0) -> list[dict]:
+    """Ranked direct links, retaining the legacy list return type.
+
+    Use :func:`links_for_page` for any user-facing list: it carries the exact
+    total and says when a page is truncated. ``limit=None`` and ``limit=0``
+    keep their longstanding internal meaning of an unbounded result.
+    """
+    links = _ranked_links(value, min_score=min_score)
+    return links[:limit] if limit else links
 
 
 def links_for_fast(value: str, *, limit: int | None = 50, min_score: float = 1.0) -> list[dict]:
@@ -1098,3 +1156,8 @@ def links_for_fast(value: str, *, limit: int | None = 50, min_score: float = 1.0
     links = [link for link in cached if link["score"] >= min_score]
     links.sort(key=lambda link: link["score"], reverse=True)
     return links[:limit] if limit else links
+
+
+def links_for_fast_page(value: str, *, limit: int | None = _GRAPH_LINK_PAGE_DEFAULT, min_score: float = 1.0) -> dict:
+    """Cached-read equivalent of :func:`links_for_page` for API hot paths."""
+    return _link_page(links_for_fast(value, limit=None, min_score=min_score), limit)

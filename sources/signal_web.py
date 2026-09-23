@@ -5,6 +5,7 @@ import hashlib
 import html
 import json
 import re
+import socket
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
@@ -16,7 +17,7 @@ import xml.etree.ElementTree as ET
 
 import httpx
 
-from utils.outbound import httpx_kwargs
+from utils.scan_destination import async_scan_client, scan_client
 
 try:
     import mmh3  # type: ignore
@@ -62,6 +63,19 @@ def _run_probes_concurrent(fns: list, *, max_workers: int = _PROBE_FANOUT) -> li
         max_workers=min(len(fns), max_workers), thread_name_prefix="web-probe"
     ) as ex:
         return list(ex.map(lambda fn: fn(), fns))
+
+
+def _missing_dns_name(exc: BaseException) -> bool:
+    """A nonexistent optional subdomain is a no-match, not a probe outage."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    missing_codes = {socket.EAI_NONAME, getattr(socket, "EAI_NODATA", None)}
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, socket.gaierror) and current.errno in missing_codes:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 LEGAL_PAGE_PATHS = (
     "/impressum",
@@ -2190,7 +2204,7 @@ def _sync_fetch_homepage(target: str, client: httpx.Client, *, timeout: float = 
 def fetch_homepage(target: str, client: httpx.Client | None = None, *, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
     if client is not None:
         return _sync_fetch_homepage(target, client, timeout=timeout)
-    with httpx.Client(**httpx_kwargs()) as owned_client:
+    with scan_client() as owned_client:
         return _sync_fetch_homepage(target, owned_client, timeout=timeout)
 
 
@@ -2230,7 +2244,7 @@ async def _async_fetch_homepage(target: str, client: httpx.AsyncClient, *, timeo
 async def async_fetch_homepage(target: str, client: httpx.AsyncClient | None = None, *, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
     if client is not None:
         return await _async_fetch_homepage(target, client, timeout=timeout)
-    async with httpx.AsyncClient(**httpx_kwargs()) as owned_client:
+    async with async_scan_client() as owned_client:
         return await _async_fetch_homepage(target, owned_client, timeout=timeout)
 
 
@@ -2347,7 +2361,7 @@ def _sync_fetch_well_known_files(target: str, client: httpx.Client, *, timeout: 
 def fetch_well_known_files(target: str, client: httpx.Client | None = None, *, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
     if client is not None:
         return _sync_fetch_well_known_files(target, client, timeout=timeout)
-    with httpx.Client(**httpx_kwargs()) as owned_client:
+    with scan_client() as owned_client:
         return _sync_fetch_well_known_files(target, owned_client, timeout=timeout)
 
 
@@ -2363,7 +2377,7 @@ async def _async_fetch_well_known_files(target: str, client: httpx.AsyncClient, 
 async def async_fetch_well_known_files(target: str, client: httpx.AsyncClient | None = None, *, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
     if client is not None:
         return await _async_fetch_well_known_files(target, client, timeout=timeout)
-    async with httpx.AsyncClient(**httpx_kwargs()) as owned_client:
+    async with async_scan_client() as owned_client:
         return await _async_fetch_well_known_files(target, owned_client, timeout=timeout)
 
 
@@ -2453,7 +2467,7 @@ def scrape_legal_pages(
 ) -> dict[str, Any]:
     if client is not None:
         return _sync_scrape_legal_pages(target, client, paths=paths, timeout=timeout)
-    with httpx.Client(**httpx_kwargs()) as owned_client:
+    with scan_client() as owned_client:
         return _sync_scrape_legal_pages(target, owned_client, paths=paths, timeout=timeout)
 
 
@@ -2537,7 +2551,7 @@ async def async_scrape_legal_pages(
 ) -> dict[str, Any]:
     if client is not None:
         return await _async_scrape_legal_pages(target, client, paths=paths, timeout=timeout)
-    async with httpx.AsyncClient(**httpx_kwargs()) as owned_client:
+    async with async_scan_client() as owned_client:
         return await _async_scrape_legal_pages(target, owned_client, paths=paths, timeout=timeout)
 
 
@@ -2728,7 +2742,7 @@ def fetch_source_map_disclosures(
             max_scripts=max_scripts,
             max_bytes=max_bytes,
         )
-    with httpx.Client(**httpx_kwargs()) as owned_client:
+    with scan_client() as owned_client:
         return _sync_fetch_source_map_disclosures(
             script_urls_or_homepage,
             owned_client,
@@ -2792,7 +2806,7 @@ async def async_fetch_source_map_disclosures(
             max_scripts=max_scripts,
             max_bytes=max_bytes,
         )
-    async with httpx.AsyncClient(**httpx_kwargs()) as owned_client:
+    async with async_scan_client() as owned_client:
         return await _async_fetch_source_map_disclosures(
             script_urls_or_homepage,
             owned_client,
@@ -2871,7 +2885,7 @@ def fetch_favicons(
             max_icons=max_icons,
             include_content=include_content,
         )
-    with httpx.Client(**httpx_kwargs()) as owned_client:
+    with scan_client() as owned_client:
         return _sync_fetch_favicons(
             target,
             owned_client,
@@ -2951,7 +2965,7 @@ async def async_fetch_favicons(
             max_icons=max_icons,
             include_content=include_content,
         )
-    async with httpx.AsyncClient(**httpx_kwargs()) as owned_client:
+    async with async_scan_client() as owned_client:
         return await _async_fetch_favicons(
             target,
             owned_client,
@@ -3001,6 +3015,7 @@ def _sync_probe_mail_client_config(target: str, client: httpx.Client, *, timeout
                 "content_type": None,
                 "parsed": {},
                 "error": str(exc),
+                "missing_host": _missing_dns_name(exc),
             }
 
     entries = _run_probes_concurrent(
@@ -3033,7 +3048,7 @@ def _sync_probe_mail_client_config(target: str, client: httpx.Client, *, timeout
 def probe_mail_client_config(target: str, client: httpx.Client | None = None, *, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
     if client is not None:
         return _sync_probe_mail_client_config(target, client, timeout=timeout)
-    with httpx.Client(**httpx_kwargs()) as owned_client:
+    with scan_client() as owned_client:
         return _sync_probe_mail_client_config(target, owned_client, timeout=timeout)
 
 
@@ -3105,7 +3120,7 @@ async def async_probe_mail_client_config(
 ) -> dict[str, Any]:
     if client is not None:
         return await _async_probe_mail_client_config(target, client, timeout=timeout)
-    async with httpx.AsyncClient(**httpx_kwargs()) as owned_client:
+    async with async_scan_client() as owned_client:
         return await _async_probe_mail_client_config(target, owned_client, timeout=timeout)
 
 
@@ -3233,7 +3248,7 @@ def fetch_page_metadata(
     timeout: float = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
     if client is None:
-        with httpx.Client(**httpx_kwargs()) as owned_client:
+        with scan_client() as owned_client:
             return fetch_page_metadata(domain, save_favicon_as=save_favicon_as, client=owned_client, timeout=timeout)
 
     homepage = _sync_fetch_homepage(domain, client, timeout=timeout)

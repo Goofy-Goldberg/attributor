@@ -18,7 +18,7 @@ def test_unset_env_returns_no_proxy_config(monkeypatch):
     monkeypatch.delenv(OUTBOUND_PROXY_ENV, raising=False)
     assert outbound_proxy_url() is None
     assert requests_proxies() is None
-    assert requests_kwargs() == {}
+    assert requests_kwargs() == {"allow_redirects": False}
     assert httpx_kwargs() == {}
 
 
@@ -26,7 +26,7 @@ def test_empty_or_whitespace_env_treated_as_unset(monkeypatch):
     for value in ("", "   "):
         monkeypatch.setenv(OUTBOUND_PROXY_ENV, value)
         assert outbound_proxy_url() is None
-        assert requests_kwargs() == {}
+        assert requests_kwargs() == {"allow_redirects": False}
         assert httpx_kwargs() == {}
 
 
@@ -37,7 +37,7 @@ def test_set_env_requests_path(monkeypatch, url):
     monkeypatch.setenv(OUTBOUND_PROXY_ENV, url)
     assert outbound_proxy_url() == url
     assert requests_proxies() == {"http": url, "https": url}
-    assert requests_kwargs() == {"proxies": {"http": url, "https": url}}
+    assert requests_kwargs() == {"allow_redirects": False, "proxies": {"http": url, "https": url}}
 
 
 @pytest.mark.parametrize("url", ["http://vpn:8888", "socks5://vpn:1080"])
@@ -64,4 +64,4 @@ def test_env_read_at_call_time(monkeypatch):
     assert httpx_kwargs() == {"proxy": "http://vpn:8888"}
     monkeypatch.delenv(OUTBOUND_PROXY_ENV)
     assert httpx_kwargs() == {}
-    assert requests_kwargs() == {}
+    assert requests_kwargs() == {"allow_redirects": False}

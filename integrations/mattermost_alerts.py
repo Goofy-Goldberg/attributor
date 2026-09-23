@@ -474,7 +474,12 @@ def send_case_notification(case: Mapping[str, Any], job: Mapping[str, Any]) -> b
     targets = _safe_list(case.get("targets"))
     target_count = case.get("total_targets") or summary.get("target_count") or len(targets)
     successful = case.get("successful_targets")
+    partial = case.get("partial_targets") or job.get("partial_targets") or 0
     failed = case.get("failed_targets")
+    coverage = _safe_dict(summary.get("provider_coverage"))
+    provider_rows = _safe_list(coverage.get("providers"))
+    provider_failures = sum(len(_safe_list(row.get("failed"))) for row in provider_rows if isinstance(row, Mapping))
+    provider_skips = sum(len(_safe_list(row.get("skipped"))) for row in provider_rows if isinstance(row, Mapping))
     duration = _duration_label(case.get("started_at") or job.get("started_at"), case.get("finished_at") or job.get("finished_at"))
 
     base_url = os.getenv("APP_BASE_URL", "").rstrip("/")
@@ -499,8 +504,10 @@ def send_case_notification(case: Mapping[str, Any], job: Mapping[str, Any]) -> b
     if duration:
         text_lines.append(f"Duration: `{duration}`")
     text_lines.append(f"Submitted: `{target_count or 0}`")
-    text_lines.append(f"Succeeded: `{successful or 0}`")
+    text_lines.append(f"Persisted: `{successful or 0}`")
+    text_lines.append(f"Partial: `{partial}`")
     text_lines.append(f"Failed: `{failed or 0}`")
+    text_lines.append(f"Provider coverage: `{provider_failures} failed, {provider_skips} skipped`")
     text_lines.append(f"Pool connections found: `{len(top_findings)}`")
     if highlights:
         text_lines.append("Strongest pool connections:")
@@ -513,7 +520,8 @@ def send_case_notification(case: Mapping[str, Any], job: Mapping[str, Any]) -> b
         f"<p><strong>Ingest:</strong> {case_id or 'unknown'}</p>",
         f"<p><strong>Status:</strong> {status}</p>",
         f"<p><strong>Duration:</strong> {duration or 'n/a'}</p>",
-        f"<p><strong>Targets:</strong> submitted {target_count or 0}, succeeded {successful or 0}, failed {failed or 0}</p>",
+        f"<p><strong>Targets:</strong> submitted {target_count or 0}, persisted {successful or 0}, partial {partial}, failed {failed or 0}</p>",
+        f"<p><strong>Provider coverage:</strong> {provider_failures} failed, {provider_skips} skipped</p>",
         f"<p><strong>Pool connections found:</strong> {len(top_findings)}</p>",
     ]
     if highlights:
@@ -528,14 +536,16 @@ def send_case_notification(case: Mapping[str, Any], job: Mapping[str, Any]) -> b
         "props": {"card": "".join(card_lines)},
         "attachments": [
             {
-                "color": "#1c8a5d" if status == "completed" else "#ba4a3d",
+                "color": "#1c8a5d" if status == "completed" else "#d48422" if status == "partial" else "#ba4a3d",
                 "title": f"Ingest {case_id or 'unknown'}",
                 "title_link": summary_url,
                 "fields": [
                     {"short": True, "title": "Submitted", "value": str(target_count or 0)},
                     {"short": True, "title": "Duration", "value": duration or "n/a"},
-                    {"short": True, "title": "Succeeded", "value": str(successful or 0)},
+                    {"short": True, "title": "Persisted", "value": str(successful or 0)},
+                    {"short": True, "title": "Partial", "value": str(partial)},
                     {"short": True, "title": "Failed", "value": str(failed or 0)},
+                    {"short": True, "title": "Provider coverage", "value": f"{provider_failures} failed, {provider_skips} skipped"},
                     {"short": True, "title": "Pool connections", "value": str(len(top_findings))},
                     {"short": True, "title": "Status", "value": status},
                 ],

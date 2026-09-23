@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import re
-import socket
 import ssl
 import sys
 import threading
@@ -43,6 +42,7 @@ from sources import signal_web
 from utils.ipinfo_lite import merge_ipinfo_lite
 from utils.censys_enrichment import merge_censys_enrichment
 from utils.outbound import requests_kwargs
+from utils.scan_destination import UnsafeScanDestination, public_address, scan_socket
 
 load_dotenv()
 
@@ -239,7 +239,7 @@ def resolve_ips(hostname: str) -> list[str]:
 def get_dns(domain: str) -> dict:
     """Resolve A, AAAA, MX, NS, TXT, SOA, CNAME, CAA records (parallel lookups)."""
 
-    def _resolve_one(rtype: str) -> tuple[str, object]:
+    def _resolve_one(rtype: str) -> tuple[str, object, str | None]:
         resolver = _build_resolver(timeout=5, lifetime=10)
         try:
             answers = resolver.resolve(domain, rtype)
@@ -247,28 +247,35 @@ def get_dns(domain: str) -> dict:
                 return rtype, [
                     {"preference": r.preference, "exchange": str(r.exchange).rstrip(".")}
                     for r in answers
-                ]
+                ], None
             if rtype == "SOA":
                 r = answers[0]
                 return rtype, {
                     "mname":  str(r.mname).rstrip("."),
                     "rname":  str(r.rname).rstrip("."),
                     "serial": int(r.serial),
-                }
+                }, None
             if rtype == "TXT":
                 return rtype, [
                     b"".join(r.strings).decode("utf-8", errors="replace")
                     for r in answers
-                ]
-            return rtype, [str(r).rstrip(".") for r in answers]
-        except Exception:
-            return rtype, []
+                ], None
+            return rtype, [str(r).rstrip(".") for r in answers], None
+        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+            return rtype, [], None
+        except Exception as exc:
+            return rtype, [], str(exc)
 
     rtypes = ("A", "AAAA", "CAA", "CNAME", "MX", "NS", "TXT", "SOA")
     out: dict = {}
+    errors: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=len(rtypes)) as ex:
-        for rtype, value in ex.map(_resolve_one, rtypes):
+        for rtype, value, error in ex.map(_resolve_one, rtypes):
             out[rtype] = value
+            if error:
+                errors[rtype] = error
+    if errors:
+        out["_errors"] = errors
     log_ok(f"DNS: A={len(out.get('A', []))} AAAA={len(out.get('AAAA', []))} "
            f"MX={len(out.get('MX', []))} NS={len(out.get('NS', []))}")
     return out
@@ -357,6 +364,9 @@ def get_crt_sh(domain: str) -> dict:
                 "issuer":     issuer_cn,
                 "not_before": entry.get("not_before"),
                 "not_after":  entry.get("not_after"),
+                # CT log entry time is historical source evidence.  The
+                # certificate validity interval is not a visit to the site.
+                "source_observed_at": entry.get("entry_timestamp"),
                 "sans":       sorted(set(sans)),
             })
 
@@ -464,6 +474,9 @@ def get_certspotter(domain: str) -> dict:
                 "issuer":     issuer_cn,
                 "not_before": entry.get("not_before"),
                 "not_after":  entry.get("not_after"),
+                # Cert Spotter's free issuance shape does not establish when
+                # the scanned site served this certificate.
+                "source_observed_at": None,
                 "sans":       sorted(set(sans)),
             })
 
@@ -763,7 +776,7 @@ def _probe_tls(ip: str, sni: str, port: int = 443, timeout: float = 5.0) -> dict
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode    = ssl.CERT_NONE
-        with socket.create_connection((ip, port), timeout=timeout) as sock:
+        with scan_socket(ip, port, timeout=timeout) as sock:
             with ctx.wrap_socket(sock, server_hostname=sni) as ssock:
                 der = ssock.getpeercert(binary_form=True)
         if not der:
@@ -810,7 +823,7 @@ def _probe_ssh(ip: str, port: int = 22, timeout: float = 5.0) -> dict:
     sock      = None
     transport = None
     try:
-        sock = socket.create_connection((ip, port), timeout=timeout)
+        sock = scan_socket(ip, port, timeout=timeout)
         transport = paramiko.Transport(sock)
         transport.start_client(timeout=timeout)
         key       = transport.get_remote_server_key()
@@ -1737,7 +1750,15 @@ def clean_target(target: str) -> str:
     target = re.split(r'[/?#]', target, maxsplit=1)[0]
     # Drop leading www. (but keep things like www2.).
     target = re.sub(r'^www\.', '', target, flags=re.I)
-    return target.strip().lower()
+    target = target.strip().lower()
+    try:
+        ipaddress.ip_address(target)
+    except ValueError:
+        return target
+    try:
+        return public_address(target)
+    except UnsafeScanDestination:
+        return ""
 
 
 def read_targets_csv(path: Path) -> list[str]:

@@ -76,6 +76,13 @@ class GraphScoringMathTests(unittest.TestCase):
         self.assertEqual(link["score"], 0)
         self.assertTrue(all(not evidence["attributing"] for evidence in link["evidence"]))
 
+    def test_link_page_reports_a_total_beyond_the_display_cap(self) -> None:
+        links = [{"target": f"channel-{index}.example", "score": 100 - index} for index in range(51)]
+        page = check._link_page(links, 50)
+        self.assertEqual(len(page["links"]), 50)
+        self.assertEqual(page["total"], 51)
+        self.assertTrue(page["has_more"])
+
 
 class ProjectionTests(unittest.TestCase):
     """What extract_selectors pulls out of a stored result — no database.

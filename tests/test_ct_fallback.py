@@ -166,7 +166,7 @@ class BasicCtFallbackTests(unittest.TestCase):
         self.assertEqual(result["issuers"], ["R3"])
         cert = result["certs"][0]
         self.assertEqual(
-            set(cert), {"id", "issuer", "not_before", "not_after", "sans"}
+            set(cert), {"id", "issuer", "not_before", "not_after", "source_observed_at", "sans"}
         )
         self.assertEqual(cert["id"], 648494876)  # string id coerced to int
         self.assertEqual(cert["issuer"], "R3")

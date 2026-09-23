@@ -176,7 +176,8 @@ def test_send_case_email_includes_counts_and_findings(monkeypatch) -> None:
     assert message["Subject"] == "[IP Intel] IP Intel case case-1: completed"
     body = message.get_content()
     assert "Submitted: 3" in body
-    assert "Succeeded: 2" in body
+    assert "Persisted: 2" in body
+    assert "Partial: 0" in body
     assert "Failed: 1" in body
     assert "Pool connections found: 1" in body
     assert "alpha.example ↔ beta.example (72)" in body

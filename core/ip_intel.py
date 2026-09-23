@@ -56,6 +56,7 @@ from tqdm import tqdm
 
 from sources.signal_transport import parse_certificate_der
 from utils.outbound import requests_kwargs
+from utils.scan_destination import UnsafeScanDestination, public_address, resolve_public_address
 
 
 RESULTS_DIR = Path(__file__).parent.parent / "results"
@@ -114,7 +115,15 @@ def log(msg: str) -> None:
 def clean_target(target: str) -> str:
     """Strip protocol prefix and trailing slashes so bare hostnames/IPs remain."""
     target = re.sub(r'^https?://', '', target)
-    return target.rstrip('/').strip()
+    target = target.rstrip('/').strip()
+    try:
+        ipaddress.ip_address(target)
+    except ValueError:
+        return target
+    try:
+        return public_address(target)
+    except UnsafeScanDestination:
+        return ""
 
 
 def _warn_dns_fallback(exc: Exception) -> None:
@@ -1114,7 +1123,7 @@ def _parse_tls_cert(der: bytes, ip: str, port: int, domain: str) -> dict | None:
 async def _tcp_open_async(ip: str, port: int, timeout: float) -> bool:
     try:
         _, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port), timeout=timeout
+            asyncio.open_connection(resolve_public_address(ip, port), port), timeout=timeout
         )
         writer.close()
         try:
@@ -1133,7 +1142,7 @@ async def _check_tls_async(ip: str, domain: str, port: int, timeout: float) -> d
         ctx.verify_mode = ssl.CERT_NONE
 
         _, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port, ssl=ctx, server_hostname=domain),
+            asyncio.open_connection(resolve_public_address(ip, port), port, ssl=ctx, server_hostname=domain),
             timeout=timeout,
         )
         ssl_obj = writer.get_extra_info("ssl_object")
@@ -1232,6 +1241,27 @@ def _count_ips(cidrs: list[str]) -> int:
     return max(total, 0)
 
 
+def _validate_scan_cidrs(cidrs: list[str]) -> None:
+    """The optional raw range scan must never include private destinations."""
+    # Masscan and the fallback CIDR expander in this CLI scan IPv4 only.
+    # A range can start and end in public space yet contain a private block
+    # (for example 172.0.0.0/8), so checking network.is_global is insufficient.
+    excluded = tuple(ipaddress.ip_network(value) for value in (
+        "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+        "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24",
+        "192.0.2.0/24", "192.168.0.0/16", "198.18.0.0/15",
+        "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4",
+        "240.0.0.0/4",
+    ))
+    for cidr in cidrs:
+        try:
+            network = ipaddress.ip_network(cidr, strict=False)
+        except ValueError as exc:
+            raise UnsafeScanDestination(f"Invalid scan range: {cidr}") from exc
+        if network.version != 4 or any(network.overlaps(block) for block in excluded):
+            raise UnsafeScanDestination(f"Non-public scan range: {cidr}")
+
+
 def _run_two_phase_scan(
     domain: str,
     cidrs: list[str],
@@ -1248,6 +1278,7 @@ def _run_two_phase_scan(
     Defers CIDR→IP expansion until after masscan is attempted — masscan takes
     the CIDR file directly so expansion is only needed for the asyncio fallback.
     """
+    _validate_scan_cidrs(cidrs)
     masscan_result = _masscan_phase1(cidrs, port, rate=rate)
     if masscan_result is not None:
         open_ips = masscan_result
@@ -1276,6 +1307,7 @@ def _masscan_phase1(cidrs: list[str], port: int, rate: int) -> list[str] | None:
     Install:  sudo apt install masscan
     Fix perms: sudo setcap cap_net_raw+ep $(which masscan)
     """
+    _validate_scan_cidrs(cidrs)
     if not shutil.which("masscan"):
         return None
 
@@ -1662,6 +1694,3 @@ _URLSCAN_ANALYTICS_KEY_MAP = {
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
-
-
-

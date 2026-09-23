@@ -11,6 +11,8 @@ RUN npm ci
 RUN npm run build
 
 
+FROM ghcr.io/astral-sh/uv:0.12.18@sha256:3adc3706091ce7c2fe595e669628caedd6d951551b92b258b7e7dbe06d9440bc AS uv
+
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -19,8 +21,14 @@ WORKDIR /app
 # `docker compose logs -f` without buffering delay.
 ENV PYTHONUNBUFFERED=1
 
-# Install uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# Keep the application environment isolated from the base image and prevent
+# uv from silently downloading a different Python runtime during the build.
+ENV UV_PYTHON_DOWNLOADS=0 \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    PATH="/opt/venv/bin:$PATH"
+
+# Install the verified, reproducibly pinned uv binary.
+COPY --from=uv /uv /usr/local/bin/uv
 
 # Install system libraries required by pycti (python-magic needs libmagic1)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -30,8 +38,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy dependency files first for layer caching
 COPY pyproject.toml uv.lock ./
 
-# Install dependencies into the system Python (no venv needed in container)
-RUN uv pip install --system --no-cache -r pyproject.toml
+# Install exactly the lockfile versions into the runtime virtual environment.
+RUN uv sync --frozen --no-dev --no-install-project --no-cache
 
 # Copy application code
 COPY app.py ./

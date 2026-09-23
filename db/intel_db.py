@@ -131,7 +131,9 @@ CREATE TABLE IF NOT EXISTS ct_certs (
     not_before  TEXT,
     not_after   TEXT,
     sans        JSONB,
-    observed_at TEXT
+    observed_at TEXT,
+    source_observed_at TEXT,
+    retrieved_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ct_search_id       ON ct_certs(search_id);
 CREATE INDEX IF NOT EXISTS idx_ct_issuer          ON ct_certs(issuer);
@@ -554,6 +556,21 @@ CREATE TABLE IF NOT EXISTS graph_paths (
 );
 CREATE INDEX IF NOT EXISTS idx_graph_paths_rd ON graph_paths(registrable_domain, hops);
 
+-- Reachability is deliberately bounded. Keep per-source state alongside the
+-- materialized paths so an absent or shortened path is never presented as a
+-- complete traversal of a dense graph.
+CREATE TABLE IF NOT EXISTS graph_path_status (
+    registrable_domain   TEXT    PRIMARY KEY,
+    materialized_count   INTEGER NOT NULL,
+    max_hops             INTEGER NOT NULL,
+    max_nodes            INTEGER NOT NULL,
+    frontier_limit       INTEGER NOT NULL,
+    node_cap_reached     BOOLEAN NOT NULL DEFAULT FALSE,
+    frontier_cap_reached BOOLEAN NOT NULL DEFAULT FALSE,
+    hop_cap_reached      BOOLEAN NOT NULL DEFAULT FALSE,
+    computed_at          TEXT
+);
+
 CREATE TABLE IF NOT EXISTS graph_state (
     id                  BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
     dirty               BOOLEAN NOT NULL DEFAULT TRUE,
@@ -606,6 +623,12 @@ UPDATE graph_state SET full_reconcile_at = NOW() WHERE full_reconcile_at IS NULL
 ALTER TABLE ips ADD COLUMN IF NOT EXISTS censys_enrichment  JSONB;
 ALTER TABLE ips ADD COLUMN IF NOT EXISTS censys_enriched_at TEXT;
 CREATE INDEX IF NOT EXISTS idx_ips_censys_enriched ON ips(censys_enriched_at);
+
+-- Historical CT evidence carries its own log date when the source supplies
+-- one. Existing observed_at values are retrieval times, not live TLS probes.
+ALTER TABLE ct_certs ADD COLUMN IF NOT EXISTS source_observed_at TEXT;
+ALTER TABLE ct_certs ADD COLUMN IF NOT EXISTS retrieved_at TEXT;
+ALTER TABLE graph_path_status ADD COLUMN IF NOT EXISTS hop_cap_reached BOOLEAN NOT NULL DEFAULT FALSE;
 
 """
 
@@ -955,7 +978,7 @@ _IDENTIFIER_HANDLE_TYPES = {
 # they are NOT append-only children of a single search — they are a global
 # projection rebuildable from the raw intel. Listed in _ALL_TABLES so schema
 # resets (tests) drop them too; ordered so dependents precede their referents.
-_CORRELATION_TABLES = ["graph_state", "graph_links", "graph_connection_counts", "graph_selector_groups", "graph_cluster_links", "graph_clusters", "entity_edges", "observations", "selectors", "entities"]
+_CORRELATION_TABLES = ["graph_state", "graph_path_status", "graph_paths", "graph_links", "graph_connection_counts", "graph_selector_groups", "graph_cluster_links", "graph_clusters", "entity_edges", "observations", "selectors", "entities"]
 
 _ALL_TABLES = ["searches", *_CHILD_TABLES, "identifiers", "search_fields", "pair_verdicts", "channel_labels", "archived_channels", *_CORRELATION_TABLES]
 
@@ -3275,8 +3298,8 @@ def _save_child_tables(c: psycopg.Connection[Any], sid: int, result: dict, times
         if not isinstance(cert, dict):
             continue
         c.execute(
-            "INSERT INTO ct_certs (search_id, cert_id, issuer, not_before, not_after, sans, observed_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-            (sid, cert.get("id"), cert.get("issuer"), cert.get("not_before"), cert.get("not_after"), _json(cert.get("sans", [])), timestamp),
+            "INSERT INTO ct_certs (search_id, cert_id, issuer, not_before, not_after, sans, observed_at, source_observed_at, retrieved_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (sid, cert.get("id"), cert.get("issuer"), cert.get("not_before"), cert.get("not_after"), _json(cert.get("sans", [])), timestamp, _safe_iso(cert.get("source_observed_at") or cert.get("entry_timestamp")), timestamp),
         )
     for san in ct.get("cross_domain_sans", []):
         c.execute("INSERT INTO cross_sans (search_id, san) VALUES (%s,%s)", (sid, san))
@@ -3303,6 +3326,8 @@ def _save_child_tables(c: psycopg.Connection[Any], sid: int, result: dict, times
 
     dns = _as_dict(result.get("dns"))
     for rtype, values in dns.items():
+        if str(rtype).startswith("_"):
+            continue
         if not values:
             continue
         if isinstance(values, list):
@@ -4435,16 +4460,30 @@ def extract_selectors(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
                     )
 
         # ── CT certs (crt.sh) SANs exhibited by the owner ──
-        ct = res.get("cert_transparency") or {}
+        ct = res.get("crt_sh") or res.get("cert_transparency") or {}
         if owner:
+            ct_sans: dict[str, list[tuple[datetime, str]]] = {}
             for cert in ct.get("certs") or []:
                 if not isinstance(cert, Mapping):
                     continue
-                nb, na = _safe_iso(cert.get("not_before")), _safe_iso(cert.get("not_after"))
+                source_date = _safe_iso(cert.get("source_observed_at") or cert.get("entry_timestamp"))
+                parsed_date = _parse_dt(source_date)
                 for san in cert.get("sans") or []:
-                    add_obs(owner, "tls_san", _normalize_tls_identity(san), "crtsh", nb, na)
+                    identity = _normalize_tls_identity(san)
+                    if identity:
+                        dates = ct_sans.setdefault(identity, [])
+                        if parsed_date and source_date:
+                            dates.append((parsed_date, source_date))
             for san in ct.get("cross_domain_sans") or []:
-                add_obs(owner, "tls_san", _normalize_tls_identity(san), "crtsh", ts, ts)
+                # This legacy aggregate has no source date. Retrieval time
+                # does not prove that the SAN was in use on that date.
+                identity = _normalize_tls_identity(san)
+                if identity:
+                    ct_sans.setdefault(identity, [])
+            for identity, dates in ct_sans.items():
+                first = min(dates, key=lambda item: item[0])[1] if dates else None
+                last = max(dates, key=lambda item: item[0])[1] if dates else None
+                add_obs(owner, "tls_san", identity, "crtsh", first, last)
 
         # ── Discovered subdomains become entities under their apex ──
         for sub in _normalize_text_list(res.get("subdomains") or []):
@@ -5156,10 +5195,9 @@ def apply_pending_graph_rescores(limit: int | None = None) -> dict[str, int]:
     count_rows: list[tuple[Any, ...]] = []
     for rd in batch:
         links = links_by_rd[rd]
-        # Same shape as rebuild_clusters: every scored link is stored, but the
-        # pool-page count uses links_for's own default top-50 cut so the number
-        # never disagrees with the domain page.
-        count_rows.append((rd, len(links[:50]), now))
+        # Keep the exact stored total in sync with rebuild_clusters. Page caps
+        # belong to API responses, not graph_connection_counts.
+        count_rows.append((rd, len(links), now))
         for link in links:
             link_rows.append((
                 rd, link["target"], link["score"], link["confidence"], link["strength"],
@@ -6131,17 +6169,26 @@ def _extend_paths(c: psycopg.Connection[Any], adjacency: dict[str, list[dict]], 
     max_hops = _graph_path_max_hops()
     max_nodes = _graph_path_max_nodes()
     c.execute("DELETE FROM graph_paths")
+    c.execute("DELETE FROM graph_path_status")
     rows: list[tuple[Any, ...]] = []
+    status_rows: list[tuple[Any, ...]] = []
     for source in all_rds:
         visited = {source}
         parent: dict[str, tuple[str, dict]] = {}
         order: list[str] = []
         queue: deque[tuple[str, int]] = deque([(source, 0)])
+        frontier_cap_reached = False
+        hop_cap_reached = False
         while queue and len(order) < max_nodes:
             node, hops = queue.popleft()
             if hops >= max_hops:
+                if any(edge["target"] not in visited for edge in adjacency.get(node, [])):
+                    hop_cap_reached = True
                 continue
-            for edge in adjacency.get(node, [])[:_PATH_FRONTIER_LIMIT]:
+            edges = adjacency.get(node, [])
+            if len(edges) > _PATH_FRONTIER_LIMIT:
+                frontier_cap_reached = True
+            for edge in edges[:_PATH_FRONTIER_LIMIT]:
                 target = edge["target"]
                 if target in visited:
                     continue
@@ -6151,6 +6198,9 @@ def _extend_paths(c: psycopg.Connection[Any], adjacency: dict[str, list[dict]], 
                 queue.append((target, hops + 1))
                 if len(order) >= max_nodes:
                     break
+        # At the limit we cannot prove the source's neighbourhood is complete,
+        # even if the queue happens to be empty after the last insertion.
+        node_cap_reached = len(order) >= max_nodes
         for target in order:
             chain: list[dict[str, Any]] = []
             cur = target
@@ -6166,11 +6216,24 @@ def _extend_paths(c: psycopg.Connection[Any], adjacency: dict[str, list[dict]], 
             rows.append(
                 (source, target, len(chain), min(hop["score"] for hop in chain), _json(chain), now)
             )
+        status_rows.append((
+            source, len(order), max_hops, max_nodes, _PATH_FRONTIER_LIMIT,
+            node_cap_reached, frontier_cap_reached, hop_cap_reached, now,
+        ))
     if rows:
         c.cursor().executemany(
             """INSERT INTO graph_paths (registrable_domain, target, hops, min_hop_score, chain, computed_at)
                VALUES (%s,%s,%s,%s,%s,%s)""",
             rows,
+        )
+    if status_rows:
+        c.cursor().executemany(
+            """INSERT INTO graph_path_status
+                   (registrable_domain, materialized_count, max_hops, max_nodes,
+                    frontier_limit, node_cap_reached, frontier_cap_reached,
+                    hop_cap_reached, computed_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            status_rows,
         )
 
 
@@ -6398,17 +6461,16 @@ def rebuild_clusters() -> dict[str, int]:
             # domain has, not just a top page-worth — connections_among()
             # below needs the full set to answer "is member #47 of a 60-node
             # cluster linked to member #12", which a top-50 cut could miss.
-            # `scored` still caps at check.links_for's own default (50) so the
-            # pool-page count never drifts from what the domain's own detail
-            # page (which does apply that cap) shows.
             all_links = all_links_by_rd[rd]
-            scored = len(all_links[:50])
-            connected_domains += 1 if scored else 0
-            adjacency[rd] = all_links[:_PATH_FRONTIER_LIMIT]
-            # Recorded unconditionally, even when scored is 0 — this table
+            # The stored total drives pool filters and summaries, so it must
+            # include every direct connection. API pages carry their own cap.
+            connection_count = len(all_links)
+            connected_domains += 1 if connection_count else 0
+            adjacency[rd] = all_links
+            # Recorded unconditionally, even when connection_count is 0 — this table
             # doubles as the "rd has been through a rebuild pass" marker
             # cached_links_for() checks, not just a connection count.
-            connection_count_rows.append((rd, scored, now))
+            connection_count_rows.append((rd, connection_count, now))
             for link in all_links:
                 graph_link_rows.append((
                     rd, link["target"], link["score"], link["confidence"], link["strength"],
@@ -6535,6 +6597,59 @@ def cached_links_for(value: str) -> list[dict[str, Any]] | None:
     ]
 
 
+def _path_status(c: psycopg.Connection[Any], rd: str) -> dict[str, Any] | None:
+    row = c.execute(
+        """SELECT materialized_count, max_hops, max_nodes, frontier_limit,
+                  node_cap_reached, frontier_cap_reached, hop_cap_reached, computed_at
+             FROM graph_path_status WHERE registrable_domain = %s""",
+        (rd,),
+    ).fetchone()
+    if row is None:
+        return {
+            "materialized_count": None,
+            "max_hops": _graph_path_max_hops(),
+            "max_nodes": _graph_path_max_nodes(),
+            "frontier_limit": _PATH_FRONTIER_LIMIT,
+            "node_cap_reached": False,
+            "frontier_cap_reached": False,
+            "hop_cap_reached": False,
+            "partial": True,
+            "stale": True,
+            "unknown": True,
+            "computed_at": None,
+        }
+    node_cap_reached = bool(row["node_cap_reached"])
+    frontier_cap_reached = bool(row["frontier_cap_reached"])
+    hop_cap_reached = bool(row["hop_cap_reached"])
+    state = c.execute("SELECT dirty FROM graph_state WHERE id").fetchone()
+    return {
+        "materialized_count": int(row["materialized_count"]),
+        "max_hops": int(row["max_hops"]),
+        "max_nodes": int(row["max_nodes"]),
+        "frontier_limit": int(row["frontier_limit"]),
+        "node_cap_reached": node_cap_reached,
+        "frontier_cap_reached": frontier_cap_reached,
+        "hop_cap_reached": hop_cap_reached,
+        "partial": node_cap_reached or frontier_cap_reached or hop_cap_reached,
+        "unknown": False,
+        # Incremental maintenance refreshes graph_links before the next whole
+        # path rebuild. Keep serving the last verified chains, but identify
+        # them as stale until that rebuild catches up.
+        "stale": bool(state and state["dirty"]),
+        "computed_at": row["computed_at"],
+    }
+
+
+def path_status_for(value: str) -> dict[str, Any] | None:
+    """Limits that governed this source's precomputed path traversal."""
+    init_db()
+    side = _resolve_side(value)
+    if not side or side[0] != "rd":
+        return None
+    with _conn() as c:
+        return _path_status(c, side[1])
+
+
 def path_between(a_value: str, b_value: str) -> dict[str, Any] | None:
     """Precomputed multi-hop chain from a to b (see graph_paths / _extend_paths,
     populated by rebuild_clusters) — an indexed read, never a live traversal.
@@ -6567,12 +6682,25 @@ def path_between(a_value: str, b_value: str) -> dict[str, Any] | None:
                 (b_rd, a_rd),
             ).fetchone()
             flipped = True
+        status = _path_status(c, a_rd)
+        if status is None and flipped:
+            status = _path_status(c, b_rd)
     if row is None:
         return None
     chain = row["chain"]
     if flipped:
         chain = [{**hop, "from": hop["to"], "to": hop["from"]} for hop in reversed(chain)]
-    return {"a": a_rd, "b": b_rd, "hops": row["hops"], "chain": chain}
+    return {
+        "a": a_rd,
+        "b": b_rd,
+        "hops": row["hops"],
+        "chain": chain,
+        "path_limits": status,
+        # A returned chain remains genuine even if the surrounding traversal
+        # was cut short. This flag describes coverage, never link validity.
+        "partial": bool(status and status["partial"]),
+        "stale": bool(status and status["stale"]),
+    }
 
 
 def related_through(value: str, *, max_hops: int | None = None, limit: int = 50) -> list[dict[str, Any]]:
@@ -6609,6 +6737,50 @@ def related_through(value: str, *, max_hops: int | None = None, limit: int = 50)
         }
         for row in rows
     ]
+
+
+def related_through_page(value: str, *, max_hops: int | None = None, min_hops: int | None = None, limit: int = 50) -> dict[str, Any]:
+    """A bounded related-path page with its materialized total and traversal limits."""
+    init_db()
+    side = _resolve_side(value)
+    safe_limit = max(1, min(int(limit or 50), 100))
+    if not side or side[0] != "rd":
+        return {"related": [], "total": 0, "limit": safe_limit, "has_more": False, "path_limits": None, "partial": False, "stale": False}
+    rd = side[1]
+    with _conn() as c:
+        where = "WHERE registrable_domain = %s"
+        params: list[Any] = [rd]
+        if max_hops is not None:
+            where += " AND hops <= %s"
+            params.append(max(1, int(max_hops)))
+        if min_hops is not None:
+            where += " AND hops >= %s"
+            params.append(max(1, int(min_hops)))
+        total = int(c.execute(f"SELECT count(*) AS n FROM graph_paths {where}", params).fetchone()["n"])
+        rows = c.execute(
+            f"""SELECT target, hops, min_hop_score, chain FROM graph_paths
+                 {where} ORDER BY hops, min_hop_score DESC LIMIT %s""",
+            (*params, safe_limit),
+        ).fetchall()
+        status = _path_status(c, rd)
+    related = [
+        {
+            "target": row["target"],
+            "hops": row["hops"],
+            "min_hop_score": float(row["min_hop_score"]),
+            "chain": row["chain"],
+        }
+        for row in rows
+    ]
+    return {
+        "related": related,
+        "total": total,
+        "limit": safe_limit,
+        "has_more": total > safe_limit,
+        "path_limits": status,
+        "partial": bool(status and status["partial"]),
+        "stale": bool(status and status["stale"]),
+    }
 
 
 def search_targets(query: str, *, limit: int = 20) -> dict[str, Any]:

@@ -295,6 +295,59 @@ class IncrementalRescoreControlFlowTests(unittest.TestCase):
         self.assertEqual(len(drain), 1)
         self.assertEqual(drain[0][1], (["a.com", "b.com"],))
 
+    def test_incremental_count_keeps_all_links_beyond_a_page(self) -> None:
+        conn = _FakeConn([
+            ("SELECT dirty_domains", [{"dirty_domains": ["a.com"]}]),
+            ("pg_try_advisory_xact_lock", [{"locked": True}]),
+        ])
+        links = [
+            {"target": f"target-{index}.com", "score": 42.0, "confidence": 70,
+             "strength": "moderate", "shared_node_count": 1, "evidence": []}
+            for index in range(51)
+        ]
+        with mock.patch.object(intel_db, "init_db"), \
+             mock.patch.object(intel_db, "_conn", return_value=conn), \
+             mock.patch.object(check, "links_for", return_value=links):
+            intel_db.apply_pending_graph_rescores()
+        count_writes = conn.sql_matching("INSERT INTO graph_connection_counts")
+        self.assertEqual(count_writes[0][1][0][1], 51)
+
+
+class PathLimitMaterializationTests(unittest.TestCase):
+    """The path table must record when its bounded traversal left work out."""
+
+    def test_records_frontier_and_node_caps(self) -> None:
+        edge = {
+            "score": 10.0, "confidence": 10, "strength": "weak", "evidence": [],
+        }
+        adjacency = {
+            "a.com": [{**edge, "target": f"target-{index}.com"} for index in range(51)],
+        }
+        conn = _FakeConn()
+        with mock.patch.dict(os.environ, {"GRAPH_PATH_MAX_NODES": "2", "GRAPH_PATH_MAX_HOPS": "3"}):
+            intel_db._extend_paths(conn, adjacency, ["a.com"], "2026-09-23T00:00:00+00:00")
+        status_writes = conn.sql_matching("INSERT INTO graph_path_status")
+        self.assertEqual(len(status_writes), 1)
+        status = status_writes[0][1][0]
+        self.assertEqual(status[0], "a.com")
+        self.assertEqual(status[1], 2)
+        self.assertTrue(status[5], "node cap must be disclosed")
+        self.assertTrue(status[6], "frontier cap must be disclosed")
+
+    def test_records_hop_cap_when_a_longer_path_remains(self) -> None:
+        edge = {"score": 10.0, "confidence": 10, "strength": "weak", "evidence": []}
+        adjacency = {
+            "a.com": [{**edge, "target": "b.com"}],
+            "b.com": [{**edge, "target": "c.com"}],
+        }
+        conn = _FakeConn()
+        with mock.patch.dict(os.environ, {"GRAPH_PATH_MAX_NODES": "200", "GRAPH_PATH_MAX_HOPS": "1"}):
+            intel_db._extend_paths(conn, adjacency, ["a.com"], "2026-09-23T00:00:00+00:00")
+        status = conn.sql_matching("INSERT INTO graph_path_status")[0][1][0]
+        self.assertFalse(status[5])
+        self.assertFalse(status[6])
+        self.assertTrue(status[7], "hop cap must be disclosed")
+
 
 class ContinuousGraphDbTests(unittest.TestCase):
     """End-to-end: a save keeps the graph current without a manual recompute."""

@@ -157,6 +157,7 @@ class CaseRuntime:
         seen_targets = {item["normalized_target"] for item in inputs}
         total_targets = len(queue)
         completed_targets = 0
+        partial_targets = 0
         failed_targets = 0
         saved_runs: list[dict[str, Any]] = []
 
@@ -166,6 +167,7 @@ class CaseRuntime:
             status="running",
             total_targets=total_targets,
             completed_targets=0,
+            partial_targets=0,
             failed_targets=0,
             percent=5,
         )
@@ -218,6 +220,7 @@ class CaseRuntime:
                 for future in done:
                     item = pending.pop(future)
                     current_target = item["target"]
+                    run: AnalysisRun | None = None
                     try:
                         run = future.result()
                         run_id = save_search_run(
@@ -236,16 +239,25 @@ class CaseRuntime:
                             helpers=run.helpers,
                         )
                         saved_runs.append({"id": run_id, "analysis": run})
-                        completed_targets += 1
+                        if run.status == "completed":
+                            completed_targets += 1
+                        elif run.status == "partial":
+                            partial_targets += 1
+                        else:
+                            failed_targets += 1
                         started_at = item.get("_started")
                         elapsed = time.monotonic() - started_at if started_at else 0.0
+                        outcome = run.status if run.status in {"completed", "partial", "failed"} else "failed"
                         self._log(
                             job_id,
-                            "success",
+                            "success" if outcome == "completed" else "warning",
                             f"Completed {current_target} in {elapsed:.1f}s "
-                            f"({completed_targets}/{total_targets} done, {failed_targets} failed)",
+                            f"({completed_targets} complete, {partial_targets} partial, "
+                            f"{failed_targets} failed of {total_targets}; {outcome})",
                             stage="enrichment",
                         )
+                        if run.error:
+                            self._log(job_id, "warning", f"{current_target}: {run.error}", stage="enrichment")
 
                         for discovered in run.discovered_targets:
                             target = clean_target(str(discovered.get("target") or ""))
@@ -281,6 +293,45 @@ class CaseRuntime:
                     except Exception as exc:  # noqa: BLE001
                         failed_targets += 1
                         self._log(job_id, "warning", f"Failed {current_target}: {exc}", stage="enrichment")
+                        if run is None:
+                            normalized = clean_target(current_target) or current_target
+                            run = AnalysisRun(
+                                target=current_target,
+                                normalized_target=normalized,
+                                target_type="ip" if ip_intel.is_ip(normalized) else "domain",
+                                depth=item["depth"],
+                                discovered_from=item["discovered_from"],
+                                discovery_reason=item["discovery_reason"],
+                                discovery_kind=item["discovery_kind"],
+                                is_seed=item["is_seed"],
+                                payload={"input": normalized, "persistence": {"status": "not_saved"}},
+                                status="failed",
+                                error=str(exc),
+                            )
+                            try:
+                                run_id = save_search_run(
+                                    case_id,
+                                    root_input=item["root_input"],
+                                    normalized_target=run.normalized_target,
+                                    target_type=run.target_type,
+                                    depth=run.depth,
+                                    discovered_from=run.discovered_from,
+                                    discovery_reason=run.discovery_reason,
+                                    discovery_kind=run.discovery_kind,
+                                    is_seed=run.is_seed,
+                                    status="failed",
+                                    error=run.error,
+                                    payload=run.payload,
+                                    helpers={},
+                                )
+                            except Exception as save_exc:  # noqa: BLE001
+                                run_id = None
+                                self._log(job_id, "warning", f"Could not save failed target outcome for {current_target}: {save_exc}", stage="enrichment")
+                        else:
+                            run.status = "failed"
+                            run.error = str(exc)
+                            run_id = None
+                        saved_runs.append({"id": run_id, "analysis": run})
 
                     update_job_progress(
                         job_id,
@@ -288,8 +339,14 @@ class CaseRuntime:
                         current_target=current_target,
                         total_targets=total_targets,
                         completed_targets=completed_targets,
+                        partial_targets=partial_targets,
                         failed_targets=failed_targets,
-                        percent=_job_percent("enrichment", completed_targets, failed_targets, total_targets),
+                        percent=_job_percent(
+                            "enrichment",
+                            completed_targets + partial_targets,
+                            failed_targets,
+                            total_targets,
+                        ),
                     )
 
             update_job_progress(
@@ -299,6 +356,7 @@ class CaseRuntime:
                 current_target=None,
                 total_targets=total_targets,
                 completed_targets=completed_targets,
+                partial_targets=partial_targets,
                 failed_targets=failed_targets,
             )
             self._log(job_id, "info", "Checking pool connections", stage="comparison")
@@ -308,25 +366,30 @@ class CaseRuntime:
                 percent=90,
                 total_targets=total_targets,
                 completed_targets=completed_targets,
+                partial_targets=partial_targets,
                 failed_targets=failed_targets,
             )
             summary = self._build_pool_summary(saved_runs)
+            terminal_status = _terminal_status(completed_targets, partial_targets, failed_targets)
             update_job_progress(
                 job_id,
                 stage="notification",
                 percent=95,
                 total_targets=total_targets,
                 completed_targets=completed_targets,
+                partial_targets=partial_targets,
                 failed_targets=failed_targets,
             )
-            self._log(job_id, "info", "Sending completion notification", stage="notification")
+            self._log(job_id, "info", f"Sending {terminal_status} notification", stage="notification")
             complete_case(
                 case_id,
                 job_id,
-                status="completed",
+                status=terminal_status,
                 summary=summary,
-                successful_targets=completed_targets,
+                successful_targets=completed_targets + partial_targets,
+                partial_targets=partial_targets,
                 failed_targets=failed_targets,
+                error=_job_completion_error(terminal_status, completed_targets, partial_targets, failed_targets),
             )
             case_row = get_case(case_id)
             job_row = get_job(job_id)
@@ -340,7 +403,8 @@ class CaseRuntime:
                 job_id,
                 status="failed",
                 summary={"error": str(exc)},
-                successful_targets=completed_targets,
+                successful_targets=completed_targets + partial_targets,
+                partial_targets=partial_targets,
                 failed_targets=failed_targets + 1,
                 percent=100,
                 error=str(exc),
@@ -352,13 +416,19 @@ class CaseRuntime:
         """
         Completion summary for a job, built from the shared correlation pool
         instead of a case-scoped pairwise comparison. Every target this job
-        scanned already joined the one global graph inline (analyze_target ->
-        intel_db.save_search), so "what did this submission connect to" is
+        saved target already joined the one global graph inline (analyze_target
+        -> intel_db.save_search), so "what did this submission connect to" is
         just the same cross-corpus linkage the /api/graph/* endpoints expose
         (utils.check.links_for) -- there is no separate per-case comparison
         to run.
         """
-        seeds = [item for item in runs if item["analysis"].is_seed]
+        persisted_runs = [
+            item
+            for item in runs
+            if not item["analysis"].payload.get("persistence")
+            or (item["analysis"].payload.get("persistence") or {}).get("status") == "saved"
+        ]
+        seeds = [item for item in persisted_runs if item["analysis"].is_seed]
         top_findings: list[dict[str, Any]] = []
         for item in seeds:
             label = pairing_label(item["analysis"].payload)
@@ -380,12 +450,14 @@ class CaseRuntime:
         top_findings = top_findings[:5]
         return {
             "target_count": len(seeds),
-            "run_count": len(runs),
+            "run_count": len(persisted_runs),
             "top_findings": top_findings,
             "highlights": [
                 f"{entry['target']} ↔ {entry['linked_target']} (score {entry['score']})"
                 for entry in top_findings
             ],
+            "target_outcomes": [_target_outcome(item) for item in runs],
+            "provider_coverage": _provider_coverage_summary(runs),
         }
 
     def _log(self, job_id: str, level: str, message: str, *, stage: str | None = None) -> None:
@@ -416,13 +488,82 @@ def _job_percent(stage: str, completed_targets: int, failed_targets: int, total_
     return 0
 
 
+def _terminal_status(completed: int, partial: int, failed: int) -> str:
+    if completed + partial == 0 and failed:
+        return "failed"
+    if partial or failed:
+        return "partial"
+    return "completed"
+
+
+def _job_completion_error(status: str, completed: int, partial: int, failed: int) -> str | None:
+    if status == "completed":
+        return None
+    return f"{completed} complete, {partial} partial, {failed} failed target scans."
+
+
+def _target_outcome(item: dict[str, Any]) -> dict[str, Any]:
+    run = item["analysis"]
+    payload = run.payload
+    return {
+        "run_id": item.get("id"),
+        "target": run.normalized_target,
+        "status": run.status,
+        "error": run.error,
+        "persistence": payload.get("persistence") or {},
+        "provider_coverage": payload.get("provider_coverage") or {},
+    }
+
+
+def _provider_coverage_summary(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate per-target provider coverage without dropping reasons/errors."""
+    providers: dict[str, dict[str, Any]] = {}
+    complete_targets = partial_targets = failed_targets = 0
+    for item in runs:
+        run = item["analysis"]
+        if run.status == "completed":
+            complete_targets += 1
+        elif run.status == "partial":
+            partial_targets += 1
+        else:
+            failed_targets += 1
+        coverage = run.payload.get("provider_coverage") or {}
+        for name in coverage.get("completed") or []:
+            entry = providers.setdefault(name, {"provider": name, "completed": 0, "failed": [], "skipped": []})
+            entry["completed"] += 1
+        for failure in coverage.get("failed") or []:
+            if not isinstance(failure, dict):
+                continue
+            name = str(failure.get("provider") or "unknown")
+            entry = providers.setdefault(name, {"provider": name, "completed": 0, "failed": [], "skipped": []})
+            entry["failed"].append({"target": run.normalized_target, "error": failure.get("error")})
+        for skipped in coverage.get("skipped") or []:
+            if not isinstance(skipped, dict):
+                continue
+            name = str(skipped.get("provider") or "unknown")
+            entry = providers.setdefault(name, {"provider": name, "completed": 0, "failed": [], "skipped": []})
+            entry["skipped"].append({"target": run.normalized_target, "reason": skipped.get("reason")})
+
+    return {
+        "target_counts": {
+            "completed": complete_targets,
+            "partial": partial_targets,
+            "failed": failed_targets,
+        },
+        "providers": [providers[name] for name in sorted(providers)],
+    }
+
+
 def build_job_response(row: dict[str, Any]) -> dict[str, Any]:
     stage = row.get("stage") or row.get("job_stage") or "intake"
     current_stage_index = JOB_STAGES.index(stage) if stage in JOB_STAGES else -1
     status = row.get("job_status") or row.get("status") or "unknown"
+    case_summary = row.get("case_summary") or {}
+    if not isinstance(case_summary, dict):
+        case_summary = {}
     steps: list[dict[str, Any]] = []
     for index, item in enumerate(JOB_STAGES):
-        if status in {"completed", "failed"} and index <= current_stage_index:
+        if status in {"completed", "partial", "failed"} and index <= current_stage_index:
             status_value = "completed"
         elif index < current_stage_index:
             status_value = "completed"
@@ -447,11 +588,24 @@ def build_job_response(row: dict[str, Any]) -> dict[str, Any]:
         "percent": row.get("percent") or row.get("job_percent") or 0,
         "completed_steps": row.get("completed_targets", 0),
         "total_steps": row.get("total_targets", 0),
+        "completed_targets": row.get("completed_targets", 0),
+        "total_targets": row.get("total_targets", 0),
+        "current_target": row.get("current_target"),
+        "partial_targets": row.get("partial_targets", 0),
         "failed_targets": row.get("failed_targets", 0),
+        "label": row.get("label"),
+        "created_by": row.get("created_by"),
+        "created_by_display": row.get("created_by_display"),
+        "created_at": row.get("created_at"),
+        "started_at": row.get("started_at"),
+        "finished_at": row.get("finished_at"),
         "updated_at": row.get("updated_at") or row.get("job_updated_at"),
         "logs": list(row.get("logs") or []),
         "steps": steps,
         "summary": _job_summary(row),
+        "result_summary": case_summary,
+        "provider_coverage": case_summary.get("provider_coverage") or {},
+        "target_outcomes": case_summary.get("target_outcomes") or [],
         "error": row.get("error"),
     }
 
@@ -461,9 +615,12 @@ def _job_summary(row: dict[str, Any]) -> str:
     completed = row.get("completed_targets", 0)
     total = row.get("total_targets", 0)
     failed = row.get("failed_targets", 0)
+    partial = row.get("partial_targets", 0)
     current = row.get("current_target")
     if status == "completed":
         return f"Completed {completed} of {total} target scans."
+    if status == "partial":
+        return f"Completed {completed} target scans; {partial} partial and {failed} failed."
     if status == "failed":
         return row.get("error") or "The job failed before finishing."
     if current:

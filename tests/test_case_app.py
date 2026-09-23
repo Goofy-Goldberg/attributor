@@ -262,6 +262,9 @@ def test_jobs_endpoint_lists_active_and_recent_cards(monkeypatch) -> None:
     assert recent.status_code == 200
     assert calls == [("active", 5_000), ("recent", 12)]
     assert active.json()["jobs"][0]["created_by_display"] == "analyst@stratc.org"
+    assert active.json()["jobs"][0]["total_targets"] == 4
+    assert active.json()["jobs"][0]["completed_targets"] == 1
+    assert active.json()["jobs"][0]["current_target"] == "example.com"
     assert recent.json()["jobs"][0]["label"] == "campaign-x"
 
 
@@ -270,6 +273,41 @@ def test_jobs_endpoint_rejects_unknown_status_and_invalid_limit(monkeypatch) -> 
     with TestClient(case_app.app) as client:
         assert client.get("/api/jobs", params={"status": "all"}).status_code == 422
         assert client.get("/api/jobs", params={"status": "recent", "limit": 201}).status_code == 422
+
+
+def test_jobs_endpoint_exposes_partial_provider_coverage(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    monkeypatch.setattr(
+        case_app,
+        "list_jobs",
+        lambda **_kwargs: [
+            {
+                "id": "partial-job",
+                "status": "partial",
+                "stage": "notification",
+                "percent": 100,
+                "total_targets": 2,
+                "completed_targets": 1,
+                "partial_targets": 1,
+                "failed_targets": 0,
+                "case_summary": {
+                    "provider_coverage": {
+                        "providers": [
+                            {"provider": "censys", "completed": 1, "failed": [], "skipped": [{"target": "followup.example", "reason": "seed-only policy"}]}
+                        ]
+                    }
+                },
+            }
+        ],
+    )
+
+    with TestClient(case_app.app) as client:
+        response = client.get("/api/jobs", params={"status": "recent"})
+
+    payload = response.json()["jobs"][0]
+    assert payload["status"] == "partial"
+    assert payload["partial_targets"] == 1
+    assert payload["provider_coverage"]["providers"][0]["skipped"][0]["target"] == "followup.example"
 
 
 def test_pool_endpoint(monkeypatch) -> None:
@@ -360,7 +398,10 @@ def test_connections_among_endpoint(monkeypatch) -> None:
     monkeypatch.setattr(case_app.intel_db, "verdict_summaries_for_pairs", lambda pairs: {
         ("a.com", "b.com"): {
             "counts": {"same_owner": 2, "different_owner": 1, "unsure": 0}, "verdicts": [],
-        }
+        },
+        ("a.com", "c.com"): {
+            "counts": {"same_owner": 0, "different_owner": 1, "unsure": 0}, "verdicts": [],
+        },
     })
     captured: dict = {}
 
@@ -370,6 +411,7 @@ def test_connections_among_endpoint(monkeypatch) -> None:
         return {
             "domains": domains,
             "pairs": [{"a": "a.com", "b": "b.com", "score": 82.0, "connected": True, "evidence": []}],
+            "pool_links": {"a.com": [{"target": "c.com", "score": 40.0, "evidence": []}]} if pool_links else {},
             "connected_pair_count": 1,
         }
 
@@ -383,6 +425,10 @@ def test_connections_among_endpoint(monkeypatch) -> None:
     assert body["pairs"][0]["verdict_summary"]["counts"] == {
         "same_owner": 2, "different_owner": 1, "unsure": 0,
     }
+    with TestClient(case_app.app) as client:
+        pool_response = client.post("/api/graph/connections", json={"domains": ["a.com", "b.com"], "pool_links": True})
+    assert pool_response.status_code == 200
+    assert pool_response.json()["pool_links"]["a.com"][0]["verdict_summary"]["counts"]["different_owner"] == 1
 
 
 def test_connections_requires_domains(monkeypatch) -> None:
@@ -430,18 +476,26 @@ def test_graph_links_endpoint(monkeypatch) -> None:
         }
     })
     monkeypatch.setattr(
-        case_app.check,
-        "links_for",
-        lambda value: [
+        case_app.cache,
+        "graph_links",
+        lambda value, *, limit: {
+            "links": [
             {"target": "b.com", "score": 100.0, "strength": "strong",
              "evidence": [{"kind": "tls_cert_sha256", "value": "abc", "degree": 2, "weight": 100.0}]}
-        ],
+            ],
+            "total": 51,
+            "limit": limit,
+            "has_more": True,
+        },
     )
     with TestClient(case_app.app) as client:
         response = client.get("/api/graph/links/a.com")
     assert response.status_code == 200
     body = response.json()
     assert body["target"] == "a.com"
+    assert body["total"] == 51
+    assert body["limit"] == 50
+    assert body["has_more"] is True
     assert body["links"][0]["target"] == "b.com"
     assert body["links"][0]["verdict_summary"]["counts"]["same_owner"] == 2
 
@@ -543,6 +597,9 @@ def test_graph_path_endpoint(monkeypatch) -> None:
 def test_graph_path_endpoint_404_when_unreachable(monkeypatch) -> None:
     _quiet(monkeypatch)
     monkeypatch.setattr(case_app.intel_db, "path_between", lambda a, b: None)
+    monkeypatch.setattr(case_app.intel_db, "path_status_for", lambda value: {
+        "partial": True, "stale": False,
+    })
     with TestClient(case_app.app) as client:
         response = client.get("/api/graph/path", params={"a": "a.com", "b": "z.com"})
     assert response.status_code == 404
@@ -559,16 +616,37 @@ def test_graph_related_endpoint(monkeypatch) -> None:
     _quiet(monkeypatch)
     monkeypatch.setattr(
         case_app.intel_db,
-        "related_through",
-        lambda value, *, max_hops, limit: [{"target": "b.com", "hops": 1, "min_hop_score": 90.0, "chain": []}],
+        "related_through_page",
+        lambda value, *, max_hops, limit: {
+            "related": [{"target": "b.com", "hops": 1, "min_hop_score": 90.0, "chain": []}],
+            "total": 61, "limit": limit, "has_more": True,
+            "path_limits": {"max_hops": 3, "partial": True}, "partial": True, "stale": False,
+        },
     )
     with TestClient(case_app.app) as client:
         response = client.get("/api/graph/related/a.com")
     assert response.status_code == 200
     body = response.json()
     assert body["target"] == "a.com"
-    assert body["total"] == 1
+    assert body["total"] == 61
+    assert body["has_more"] is True
+    assert body["partial"] is True
     assert body["related"][0]["target"] == "b.com"
+
+
+def test_graph_related_can_page_indirect_paths_only(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    captured = {}
+
+    def page(value, **kwargs):
+        captured.update(kwargs)
+        return {"related": [], "total": 0, "limit": kwargs["limit"], "has_more": False, "partial": False, "stale": False}
+
+    monkeypatch.setattr(case_app.intel_db, "related_through_page", page)
+    with TestClient(case_app.app) as client:
+        response = client.get("/api/graph/related/a.com?min_hops=2")
+    assert response.status_code == 200
+    assert captured["min_hops"] == 2
 
 
 def test_search_endpoint(monkeypatch) -> None:

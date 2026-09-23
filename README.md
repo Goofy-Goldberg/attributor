@@ -142,7 +142,34 @@ The Docker setup:
 - runs Better Auth with its own PostgreSQL `auth` schema; see [authentication](docs/authentication.md) for required secrets and Mattermost setup
 - mounts `./data` for downloaded artifacts and any other persistent files
 
+The backend image installs frozen `uv.lock` dependencies into `/opt/venv`.
+That environment stays available when the development overlay bind-mounts the
+source tree at `/app`.
+
 ## VPN / Outbound Proxy
+
+### Scan destination safety
+
+Site HTTP probes resolve each requested host at connection time, reject the
+request if any resolved address is non-public, and connect to a validated IP
+while retaining the original HTTP Host header, TLS SNI, and certificate name.
+The same check runs for every redirect and discovered page resource. Direct
+TLS and SSH probes, including the optional origin-scan CLI probes, also use
+the validated IP. Literal loopback, private, link-local, and other non-public
+IP targets are rejected at input normalization. Provider API requests use
+fixed endpoints and do not follow redirects.
+
+When `OUTBOUND_PROXY_URL` is set, site probes pass the validated IP to the
+HTTP or SOCKS proxy; the proxy does not resolve the original hostname. The
+proxy is trusted infrastructure and must preserve that destination. For HTTPS
+site probes, the original hostname is retained for TLS verification even when
+an HTTP proxy tunnels to the validated IP. The locked HTTP core can format an
+IPv6-only HTTP CONNECT target without brackets, which some proxies reject;
+those probes fail closed. Internal services such as PostgreSQL, Better Auth,
+OpenCTI, and notifications use their
+own connections and are unaffected. Deployment egress filtering that denies
+private address ranges is an additional defense for third-party SDK traffic
+and future collectors; this application does not install firewall rules.
 
 External OSINT providers (crt.sh, CIRCL pDNS, HackerTarget, urlscan.io,
 plus direct probes of target sites) rate-limit per source IP. Outbound provider
@@ -229,9 +256,9 @@ token. Graph recompute and graph email require the `admin` role.
 
 ### Ingestion
 
-- `POST /api/ingest` — add URLs, domains, IPs, or a CSV to the pool. JSON accepts `{"target": "...", "label": "..."}` for one target, or `{"targets": ["https://example.com/page", "example.org"], "label": "..."}` for a manual list; multipart with a CSV `file` is also supported. URL paths and query strings are accepted, but each URL is scanned by hostname. An optional `label` is attached to every submitted registrable domain with the job ID, authenticated user ID, and time. Repeating a scan with another label adds it to the channel; IP targets have no registrable domain to label. Returns a `job_id` to poll. The scanned targets join the one shared correlation graph.
-- `GET /api/jobs?status=active|recent&limit=` — shared work queue summaries, newest first. `active` returns queued and running jobs (default limit 5,000); `recent` returns completed and failed jobs (default limit 50, maximum 200). Each job includes its creator subject and signed display claim when available, the optional ingest label, progress totals, and timestamps.
-- `GET /api/jobs/{job_id}` — poll live ingest progress (stage, percent, logs).
+- `POST /api/ingest` — add URLs, domains, IPs, or a CSV to the pool. JSON accepts `{"target": "...", "label": "..."}` for one target, or `{"targets": ["https://example.com/page", "example.org"], "label": "..."}` for a manual list; multipart with a CSV `file` is also supported. URL paths and query strings are accepted, but each URL is scanned by hostname. An optional `label` is attached to every submitted registrable domain with the job ID, authenticated user ID, and time. Repeating a scan with another label adds it to the channel; IP targets have no registrable domain to label. Returns a `job_id` to poll. Targets that reach the intel store join the shared correlation graph.
+- `GET /api/jobs?status=active|recent&limit=` — shared work queue summaries, newest first. `active` returns queued and running jobs (default limit 5,000); `recent` returns completed, partial, and failed jobs (default limit 50, maximum 200). Each job includes its creator subject and signed display claim when available, the optional ingest label, completed/partial/failed target totals, provider coverage, and timestamps.
+- `GET /api/jobs/{job_id}` — poll live ingest progress (stage, percent, logs) and the durable target outcomes. A `partial` result retains observations that reached storage but records provider failures and intentional skips; a storage failure is `failed` and never claimed as ingested. Raw target payloads remain in the job's internal `search_runs` record for recovery without re-running providers.
 
 #### Ingestion pipeline tuning
 
@@ -248,7 +275,7 @@ token. Graph recompute and graph email require the `admin` role.
 
 ### Connections (global)
 
-- `POST /api/graph/connections` — body `{"domains": ["a.com","b.com",…], "pool_links": true}`. Returns the pairwise links **among the selected channels** (which of them connect to each other, with evidence) and, when `pool_links` is set, each one's strongest connections to the wider pool.
+- `POST /api/graph/connections` — body `{"domains": ["a.com","b.com",…], "pool_links": true}`. Returns the pairwise links **among the selected channels** (which of them connect to each other, with evidence) and, when `pool_links` is set, each one's strongest connections to the wider pool. Both pair and pool links include analyst verdict summaries; capped pool lists carry `pool_link_meta` totals and `has_more` flags.
 - `GET /api/graph/links/{value}` — ranked cross-corpus connections for one channel, each with its shared-node evidence breakdown (selector kind, value, degree, weight, time-overlap window, sources).
 - `GET /api/graph/link?a=<rd>&b=<rd>` — the connecting evidence between two channels.
 - `GET /api/graph/selector-kinds` — the edge types available for browsing (selector kind / `shared_ip`) and how many cross-channel groups each forms.
@@ -256,7 +283,7 @@ token. Graph recompute and graph email require the `admin` role.
 - `GET /api/graph/clusters` — the strongest clusters lake-wide.
 - `GET /api/graph/cluster/{value}` — the cluster a channel belongs to, with members.
 - `GET /api/graph/path?a=<rd>&b=<rd>` — the precomputed shortest evidence chain connecting two channels, hop by hop (`db/intel_db.py`'s `path_between` / `graph_paths` table — see [Multi-hop path precompute](#multi-hop-path-precompute)). 404 if no path exists within the configured hop limit.
-- `GET /api/graph/related/{value}` — a channel's precomputed multi-hop neighborhood (direct links plus everything reachable through an intermediary), strongest/shortest first. Query params `max_hops`, `limit`.
+- `GET /api/graph/related/{value}` — a channel's precomputed multi-hop neighborhood (direct links plus everything reachable through an intermediary), strongest/shortest first. Query params `min_hops`, `max_hops`, `limit`; `min_hops=2` returns only indirect paths and makes `total` an indirect-path count.
 - `POST /api/graph/recompute` — global recompute: rebuild the whole correlation graph + clusters from stored intel (no rescanning).
 
 ### Analyst verdicts
@@ -294,8 +321,13 @@ the frontend:
 - All scanned domains/IPs join the global pool and the rebuildable correlation
   graph; no user-facing case scope is reintroduced.
 - Active provider behavior remains Censys plus free/no-paid-credit sources.
-  Missing keys, provider tier failures, and source errors degrade per source
-  without aborting the run.
+  Missing keys, provider tier failures, intentional profile skips, and source
+  errors are recorded as structured coverage for the main services, supplemental
+  collectors, reverse lookup, and per-IP enrichment. They make an otherwise
+  persisted target `partial` without discarding the raw result or rerunning
+  providers solely to retry storage.
+  Microsoft tenant lookups treat an explicit tenant-not-found response as a
+  no-match; rate limits, server errors, and transport failures remain visible.
 - Censys/free-source hits that expose IPs, certificates, ASNs, or hostnames feed
   the same persistence and correlation paths as DNS/TLS/SSH observations.
 - OpenCTI full sweeps process every website Channel, persist tier labels by
@@ -344,6 +376,20 @@ overlap score higher than the same selector seen years apart. Base weights and
 strength tiers live in `utils/evidence_meta.py`; the linkage/scoring engine is in
 `utils/check.py` (`link_evidence`, `links_for`); clustering is connected
 components over the whole attributing graph (`graph_clusters`).
+
+CT SAN evidence uses the certificate's CT log entry time, when crt.sh supplies
+one, as its historical source date. Certificate `not_before` and `not_after`
+remain validity metadata and are never treated as observation dates. The scan
+timestamp is retrieval time, not proof that the site served the certificate.
+`ct_certs` stores `source_observed_at` and `retrieved_at` separately; its older
+`observed_at` column remains a retrieval-time compatibility field. For legacy
+CT records and Cert Spotter results without a log date, the graph retains an
+unknown observation window and gives CT-only SAN matches minimum freshness
+credit. A live TLS probe has its own scan-time observation and can supply
+current evidence independently. This conservative rule does not change base
+weights or establish an ownership probability. Existing derived observations,
+link scores, counts, and paths need a full graph recompute after deployment to
+reflect this policy; no external data is recomputed by this local change.
 Shared IPs classified as CDN, hosting pools, or provider mail infrastructure
 do not join cluster components; a full recompute can therefore split clusters
 that were held together only by those IPs.
@@ -408,9 +454,21 @@ rounding so it never claims certainty.
 
 `graph_links` (built by `rebuild_clusters()`) is a scored, weighted adjacency list of each domain's *direct* connections. On top of it, the same rebuild pass BFS-walks every domain out to a configurable hop limit and materializes the result into a `graph_paths` table (`db/intel_db.py`'s `_extend_paths`), so "why is A related to C" — including a same-cluster relationship with no direct edge — is always an indexed `SELECT` (`path_between`, `related_through`; see `GET /api/graph/path` and `GET /api/graph/related/{value}`) rather than a live traversal triggered by a search or page load.
 
+`graph_connection_counts` stores the full number of direct scored links, while
+user-facing link pages are capped independently. Their responses include
+`total`, `limit`, and `has_more`; pool-link previews carry the same metadata.
+`graph_path_status` records each source traversal's node, frontier, and hop caps.
+Path responses expose those `path_limits` plus `partial` and `stale`, so an
+absent path is not treated as proof that no longer or newer path exists. A
+preexisting path index without a coverage record is marked incomplete until
+the next full graph rebuild.
+
 - `GRAPH_PATH_MAX_HOPS` (default `3`) — how many hops the BFS walks per domain.
 - `GRAPH_PATH_MAX_NODES` (default `200`) — cap on how many reachable domains are materialized per source domain, so a densely-connected hub doesn't blow up the table.
 - Each BFS step only follows a node's own top-N direct links (frontier-limited, independent of `graph_links`' own unlimited storage), so a hub domain with hundreds of direct connections can't blow up every other domain's path walk.
+- Incremental maintenance refreshes direct links and counts first. It leaves the
+  last whole-pool path index available and marks it `stale` until the next
+  cluster rebuild materializes paths again.
 - `rebuild_clusters()` runs `DELETE FROM graph_clusters` / `graph_cluster_links` rather than `TRUNCATE` before rematerializing them: `TRUNCATE` takes an `ACCESS EXCLUSIVE` lock held until commit, which would block every concurrent `/api/pool` and `/api/graph/clusters` read for the whole (potentially long) rebuild. `DELETE` only takes `ROW EXCLUSIVE`, so readers keep seeing the previous snapshot under MVCC and flip to the new one atomically on commit.
 
 #### WHOIS capture and redaction filtering
@@ -649,6 +707,12 @@ docker compose exec ip-intel python -m scripts.ingest_opencti_channels --dry-run
 Since this script runs detached (stdout redirected to a logfile, no terminal attached), it attaches its own stdout handler to the `ip_intel` logger family (`_configure_logging()`) — the web app's handler setup in `cases/case_app.py` never runs here, so without this, per-domain scan progress (crt.sh hit counts, slow-step warnings, etc.) would silently never reach the log. Level honors `IP_INTEL_LOG_LEVEL` (default `INFO`).
 
 The tier shows up wherever the domain does: a colored badge next to the name on the pool listing and the domain detail page, and node fill color (with a legend) on the network graph (`ClusterGraph.jsx`) — tier 1 (highest priority) is deep red, fading through orange/amber/blue to tier 5 (slate). `GET /api/pool`, `GET /api/domain/{value}`, and `POST /api/graph/connections` all include tier data (`list_pool_domains`, `domain_profile`, `check.connections_among` respectively).
+
+The sweep treats `completed`, `partial`, and `failed` as terminal batch
+outcomes. It attaches labels and proceeds to later batches for all three, then
+reports separate totals and exits unsuccessfully if any batch was partial or
+failed. This keeps provider gaps visible without leaving the command polling
+forever after a partial batch.
 
 ## Configuration
 

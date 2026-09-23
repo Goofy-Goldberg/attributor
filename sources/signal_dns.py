@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from utils.outbound import httpx_kwargs
+from utils.scan_destination import async_scan_client, scan_client
 
 try:
     import dns.asyncresolver
@@ -991,6 +991,21 @@ def extract_microsoft_tenant_guid_from_openid(document: Mapping[str, Any] | Any)
     return None
 
 
+def _microsoft_http_error_code(response: Any) -> str | None:
+    """Keep only a stable provider code, not the full error body or trace IDs."""
+    try:
+        body = response.json()
+    except Exception:
+        return None
+    if not isinstance(body, Mapping):
+        return None
+    description = str(body.get("error_description") or "")
+    if "AADSTS90002" in description.upper():
+        return "AADSTS90002"
+    code = str(body.get("error") or "").strip()
+    return code or None
+
+
 async def probe_microsoft_tenant_guid(
     domain: str,
     *,
@@ -1000,11 +1015,10 @@ async def probe_microsoft_tenant_guid(
     target = _normalize_domain(domain)
     created_client = client is None
     if created_client:
-        client = httpx.AsyncClient(
+        client = async_scan_client(
             timeout=httpx.Timeout(10.0, read=15.0),
             follow_redirects=True,
             headers={"User-Agent": "ip-intel/signal-dns"},
-            **httpx_kwargs(),
         )
 
     async def _probe(url: str) -> dict[str, Any]:
@@ -1018,6 +1032,7 @@ async def probe_microsoft_tenant_guid(
                 "ok": False,
                 "status_code": response.status_code,
                 "error": "unexpected_status",
+                "error_code": _microsoft_http_error_code(response),
             }
         try:
             document = response.json()
@@ -1083,11 +1098,10 @@ def probe_microsoft_tenant_guid_sync(
     target = _normalize_domain(domain)
     created_client = client is None
     if created_client:
-        client = httpx.Client(
+        client = scan_client(
             timeout=httpx.Timeout(10.0, read=15.0),
             follow_redirects=True,
             headers={"User-Agent": "ip-intel/signal-dns"},
-            **httpx_kwargs(),
         )
 
     probes: list[dict[str, Any]] = []
@@ -1106,6 +1120,7 @@ def probe_microsoft_tenant_guid_sync(
                         "ok": False,
                         "status_code": response.status_code,
                         "error": "unexpected_status",
+                        "error_code": _microsoft_http_error_code(response),
                     }
                 )
                 continue
@@ -1229,6 +1244,7 @@ async def aprobe_microsoft_tenant(domain: str, client: httpx.AsyncClient | None 
         "token_endpoint": None,
         "source_url": result.get("source"),
         "error": None if result.get("tenant_id") else "not_found",
+        "results": result.get("results") or [],
     }
 
 
@@ -1248,6 +1264,7 @@ def probe_microsoft_tenant_sync(domain: str) -> dict[str, Any]:
         "token_endpoint": None,
         "source_url": result.get("source"),
         "error": None if result.get("tenant_id") else "not_found",
+        "results": result.get("results") or [],
     }
 
 

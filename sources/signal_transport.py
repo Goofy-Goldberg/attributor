@@ -6,7 +6,6 @@ import ipaddress
 import json
 import math
 import shutil
-import socket
 import ssl
 import subprocess
 from typing import Any
@@ -16,6 +15,7 @@ from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed25519, ed448, rsa
 from cryptography.x509.oid import NameOID
+from utils.scan_destination import resolve_public_addresses, scan_socket
 
 try:
     import paramiko
@@ -366,7 +366,7 @@ def fetch_tls_certificate(
         pass
 
     try:
-        with socket.create_connection((ip, port), timeout=timeout) as raw_sock:
+        with scan_socket(ip, port, timeout=timeout) as raw_sock:
             with ctx.wrap_socket(raw_sock, server_hostname=server_hostname) as ssl_sock:
                 der = ssl_sock.getpeercert(binary_form=True)
                 cert_info = parse_certificate_der(der, ip=ip, port=port, sni_used=server_hostname)
@@ -403,7 +403,7 @@ def capture_best_effort_tls_transport_fingerprint(
             pass
 
     try:
-        with socket.create_connection((host, port), timeout=timeout) as raw_sock:
+        with scan_socket(host, port, timeout=timeout) as raw_sock:
             with ctx.wrap_socket(raw_sock, server_hostname=server_hostname) as ssl_sock:
                 return build_best_effort_tls_transport_fingerprint(
                     ssl_sock,
@@ -422,7 +422,7 @@ def _grab_ssh_host_keys_paramiko(host: str, *, port: int, timeout: float) -> lis
     sock = None
     transport = None
     try:
-        sock = socket.create_connection((host, port), timeout=timeout)
+        sock = scan_socket(host, port, timeout=timeout)
         transport = paramiko.Transport(sock)
         transport.banner_timeout = timeout
         transport.auth_timeout = timeout
@@ -462,28 +462,38 @@ def _grab_ssh_host_keys_ssh_keyscan(host: str, *, port: int, timeout: float) -> 
 
     timeout_seconds = max(1, int(math.ceil(timeout)))
     try:
-        proc = subprocess.run(
-            [
-                ssh_keyscan,
-                "-T",
-                str(timeout_seconds),
-                "-p",
-                str(port),
-                "-t",
-                "ed25519,ecdsa,rsa",
-                host,
-            ],
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=timeout_seconds + 1,
-        )
+        destinations = resolve_public_addresses(host, port)
     except Exception:  # noqa: BLE001
         return []
 
+    raw_lines: list[str] = []
+    for destination in destinations:
+        try:
+            proc = subprocess.run(
+                [
+                    ssh_keyscan,
+                    "-T",
+                    str(timeout_seconds),
+                    "-p",
+                    str(port),
+                    "-t",
+                    "ed25519,ecdsa,rsa",
+                    destination,
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=timeout_seconds + 1,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        raw_lines.extend(proc.stdout.splitlines())
+        if any(line.strip() and not line.lstrip().startswith("#") for line in raw_lines):
+            break
+
     results: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
-    for raw_line in proc.stdout.splitlines():
+    for raw_line in raw_lines:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue

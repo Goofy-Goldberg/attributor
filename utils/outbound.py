@@ -45,9 +45,12 @@ def requests_proxies() -> dict[str, str] | None:
 
 
 def requests_kwargs() -> dict[str, Any]:
-    """Kwargs to splat into ``requests.get/post/head(...)`` calls."""
+    """Provider GET kwargs. Reject redirects to destinations outside fixed APIs."""
     proxies = requests_proxies()
-    return {"proxies": proxies} if proxies is not None else {}
+    kwargs: dict[str, Any] = {"allow_redirects": False}
+    if proxies is not None:
+        kwargs["proxies"] = proxies
+    return kwargs
 
 
 def httpx_kwargs() -> dict[str, Any]:

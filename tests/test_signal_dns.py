@@ -86,6 +86,34 @@ class SignalDnsTests(unittest.TestCase):
         self.assertIsNone(result["tenant_id"])
         self.assertEqual(result["results"][0]["error"], "invalid_payload:str")
 
+    def test_probe_microsoft_tenant_sync_keeps_provider_failures(self) -> None:
+        raw = {"tenant_id": None, "source": None, "results": [
+            {"url": "https://login.microsoftonline.com/example.com", "ok": False,
+             "status_code": 503, "error": "unexpected_status"},
+        ]}
+        with patch.object(signal_dns, "probe_microsoft_tenant_guid_sync", return_value=raw):
+            result = signal_dns.probe_microsoft_tenant_sync("example.com")
+        self.assertEqual(result["error"], "not_found")
+        self.assertEqual(result["results"], raw["results"])
+
+    def test_invalid_tenant_http_400_keeps_provider_code(self) -> None:
+        class Response:
+            status_code = 400
+
+            @staticmethod
+            def json():
+                return {"error": "invalid_tenant", "error_description": "AADSTS90002: Tenant not found."}
+
+        class Client:
+            def get(self, _url):
+                return Response()
+
+        result = signal_dns.probe_microsoft_tenant_guid_sync(
+            "example.org", client=Client(), endpoints=("https://login.microsoftonline.com/{domain}",),
+        )
+        self.assertEqual(result["results"][0]["status_code"], 400)
+        self.assertEqual(result["results"][0]["error_code"], "AADSTS90002")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -35,6 +35,7 @@ def init_db() -> None:
             input_mode TEXT NOT NULL,
             total_targets INTEGER NOT NULL DEFAULT 0,
             successful_targets INTEGER NOT NULL DEFAULT 0,
+            partial_targets INTEGER NOT NULL DEFAULT 0,
             failed_targets INTEGER NOT NULL DEFAULT 0,
             summary JSONB NOT NULL DEFAULT '{}'::jsonb,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -55,6 +56,7 @@ def init_db() -> None:
             percent INTEGER NOT NULL DEFAULT 0,
             total_targets INTEGER NOT NULL DEFAULT 0,
             completed_targets INTEGER NOT NULL DEFAULT 0,
+            partial_targets INTEGER NOT NULL DEFAULT 0,
             failed_targets INTEGER NOT NULL DEFAULT 0,
             current_target TEXT,
             logs JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -70,6 +72,8 @@ def init_db() -> None:
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS label TEXT",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS created_by TEXT",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS created_by_display TEXT",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS partial_targets INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE cases ADD COLUMN IF NOT EXISTS partial_targets INTEGER NOT NULL DEFAULT 0",
         """
         CREATE TABLE IF NOT EXISTS job_logs (
             id BIGSERIAL PRIMARY KEY,
@@ -372,6 +376,7 @@ def get_case(case_id: str) -> dict[str, Any] | None:
                     j.stage AS job_stage,
                     j.updated_at AS job_updated_at,
                     j.completed_targets,
+                    j.partial_targets,
                     j.failed_targets,
                     j.total_targets,
                     j.current_target,
@@ -398,8 +403,12 @@ def get_job(job_id: str) -> dict[str, Any] | None:
                 """
                 SELECT
                     j.*,
+                    c.summary AS case_summary,
+                    c.successful_targets,
+                    c.partial_targets AS case_partial_targets,
                     COALESCE(log_rows.logs, j.logs, '[]'::jsonb) AS logs
                 FROM jobs j
+                JOIN cases c ON c.id = j.case_id
                 LEFT JOIN LATERAL (
                     SELECT jsonb_agg(
                         jsonb_build_object(
@@ -429,7 +438,7 @@ def list_jobs(*, status: str, limit: int) -> list[dict[str, Any]]:
     """Return lightweight job cards for the shared analyst work queue."""
     statuses = {
         "active": ["queued", "running"],
-        "recent": ["completed", "failed"],
+        "recent": ["completed", "partial", "failed"],
     }.get(status)
     if statuses is None:
         raise ValueError(f"Unsupported job status filter: {status}")
@@ -437,13 +446,15 @@ def list_jobs(*, status: str, limit: int) -> list[dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, status, stage, percent, current_target,
-                       total_targets, completed_targets, failed_targets,
+                SELECT j.id, j.status, j.stage, j.percent, j.current_target,
+                       j.total_targets, j.completed_targets, j.partial_targets, j.failed_targets,
                        label, created_by, created_by_display,
-                       created_at, started_at, finished_at, updated_at
-                FROM jobs
-                WHERE status = ANY(%s::text[])
-                ORDER BY created_at DESC, id DESC
+                       j.created_at, j.started_at, j.finished_at, j.updated_at,
+                       c.summary AS case_summary
+                FROM jobs j
+                JOIN cases c ON c.id = j.case_id
+                WHERE j.status = ANY(%s::text[])
+                ORDER BY j.created_at DESC, j.id DESC
                 LIMIT %s
                 """,
                 (statuses, limit),
@@ -539,6 +550,7 @@ def update_job_progress(
     percent: int | None = None,
     total_targets: int | None = None,
     completed_targets: int | None = None,
+    partial_targets: int | None = None,
     failed_targets: int | None = None,
     current_target: str | None = None,
     status: str | None = None,
@@ -551,6 +563,7 @@ def update_job_progress(
         ("percent", percent),
         ("total_targets", total_targets),
         ("completed_targets", completed_targets),
+        ("partial_targets", partial_targets),
         ("failed_targets", failed_targets),
         ("current_target", current_target),
         ("status", status),
@@ -985,6 +998,7 @@ def complete_case(
     status: str,
     summary: dict[str, Any],
     successful_targets: int,
+    partial_targets: int,
     failed_targets: int,
     percent: int = 100,
     error: str | None = None,
@@ -997,12 +1011,13 @@ def complete_case(
                 SET status = %s,
                     summary = %s,
                     successful_targets = %s,
+                    partial_targets = %s,
                     failed_targets = %s,
                     finished_at = NOW(),
                     updated_at = NOW()
                 WHERE id = %s
                 """,
-                (status, Jsonb(summary), successful_targets, failed_targets, case_id),
+                (status, Jsonb(summary), successful_targets, partial_targets, failed_targets, case_id),
             )
             cur.execute(
                 """
@@ -1010,12 +1025,13 @@ def complete_case(
                 SET status = %s,
                     stage = 'notification',
                     percent = %s,
+                    partial_targets = %s,
                     error = %s,
                     finished_at = NOW(),
                     updated_at = NOW()
                 WHERE id = %s
                 """,
-                (status, percent, error, job_id),
+                (status, percent, partial_targets, error, job_id),
             )
         conn.commit()
 

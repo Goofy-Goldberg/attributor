@@ -19,6 +19,7 @@ from core import ip_intel
 from sources import censys_discovery
 from sources import signal_dns
 from sources import signal_web
+from utils.scan_destination import UnsafeScanDestination, public_address
 
 
 StageLogger = Callable[[str, str], None]
@@ -151,13 +152,225 @@ class AnalysisRun:
     error: str | None = None
 
 
+def provider_coverage(payload: dict[str, Any], *, target_type: str) -> dict[str, Any]:
+    """Describe which external sources contributed to a target result.
+
+    ``basic.analyze`` deliberately contains individual source failures so one
+    unavailable service cannot discard all the other observations. That makes
+    the raw payload useful, but a caller must not mistake it for full provider
+    coverage. Keep the result structured and durable with the raw scan so job
+    summaries, notifications, and later recovery all tell the same story.
+    """
+    completed: list[str] = []
+    failed: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    for name, _service in (basic.SERVICES if target_type == "domain" else []):
+        result = payload.get(name)
+        if not isinstance(result, dict):
+            failed.append({"provider": name, "error": "Provider returned no result."})
+        elif result.get("skipped"):
+            skipped.append(
+                {
+                    "provider": name,
+                    "reason": str(result.get("reason") or "Provider was intentionally skipped."),
+                }
+            )
+        elif result.get("error") or result.get("_failed"):
+            failed.append(
+                {
+                    "provider": name,
+                    "error": str(result.get("error") or "Provider reported a failure."),
+                }
+            )
+        elif name == "dns" and result.get("_errors"):
+            failed.append({
+                "provider": "dns",
+                "error": "; ".join(f"{rtype}: {error}" for rtype, error in sorted(result["_errors"].items())),
+            })
+        elif name == "page_metadata" and isinstance(result.get("status_code"), int) and result["status_code"] >= 400 and result["status_code"] not in {404, 410}:
+            failed.append({"provider": "page_metadata", "error": f"HTTP {result['status_code']}"})
+        elif name == "crt_sh" and result.get("source") == "certspotter":
+            failed.append({"provider": "crt_sh", "error": "crt.sh was unavailable; Cert Spotter fallback was used."})
+            completed.append("certspotter")
+        else:
+            completed.append(name)
+
+    for failure in payload.get("collector_failures") or []:
+        if isinstance(failure, dict):
+            failed.append({
+                "provider": str(failure.get("provider") or "supplemental collection"),
+                "error": str(failure.get("error") or "Collector failed."),
+            })
+
+    legal_pages = payload.get("legal_pages") or {}
+    if isinstance(legal_pages, dict):
+        for page in legal_pages.get("pages") or []:
+            if not isinstance(page, dict):
+                continue
+            code = page.get("status_code")
+            error = page.get("error") or (f"HTTP {code}" if isinstance(code, int) and code >= 400 and code not in {404, 410} else None)
+            if error:
+                failed.append({
+                    "provider": f"legal_pages:{page.get('path') or page.get('url') or 'page'}",
+                    "error": str(error),
+                })
+
+    well_known = payload.get("well_known") or {}
+    if isinstance(well_known, dict):
+        for name, item in (well_known.get("raw") or {}).items():
+            if not isinstance(item, dict) or item.get("found"):
+                continue
+            attempts = [attempt for attempt in item.get("attempts") or [] if isinstance(attempt, dict)]
+            failure = next((
+                attempt.get("error") or f"HTTP {attempt['status_code']}"
+                for attempt in attempts
+                if attempt.get("error") or (
+                    isinstance(attempt.get("status_code"), int)
+                    and attempt["status_code"] >= 400
+                    and attempt["status_code"] not in {404, 410}
+                )
+            ), None)
+            if failure:
+                failed.append({"provider": f"well_known:{name}", "error": str(failure)})
+
+    tenant = payload.get("microsoft_tenant") or {}
+    if isinstance(tenant, dict):
+        for probe in tenant.get("results") or []:
+            if not isinstance(probe, dict):
+                continue
+            error = probe.get("error")
+            # A 404 is a successful no-match for a domain outside Microsoft
+            # tenancy. A 429/5xx also uses `unexpected_status` but is a real
+            # provider failure, as are transport and malformed-response errors.
+            expected_miss = (
+                error == "unexpected_status"
+                and (
+                    probe.get("status_code") == 404
+                    or (probe.get("status_code") == 400 and probe.get("error_code") in {"invalid_tenant", "AADSTS90002"})
+                )
+            )
+            if error and not expected_miss:
+                detail = f"HTTP {probe['status_code']}" if error == "unexpected_status" and probe.get("status_code") else error
+                failed.append({"provider": "microsoft_tenant", "error": f"{probe.get('url') or 'endpoint'}: {detail}"})
+
+    mail_config = payload.get("mail_client_config") or {}
+    if isinstance(mail_config, dict):
+        for kind in ("autodiscover", "autoconfig"):
+            for probe in mail_config.get(kind) or []:
+                if not isinstance(probe, dict) or probe.get("missing_host"):
+                    continue
+                code = probe.get("status_code")
+                error = probe.get("error") or (f"HTTP {code}" if isinstance(code, int) and code >= 400 and code not in {404, 410} else None)
+                if error:
+                    failed.append({
+                        "provider": f"mail_client_config:{kind}:{probe.get('label') or 'endpoint'}",
+                        "error": str(error),
+                    })
+
+    source_maps = payload.get("source_map_disclosures") or {}
+    if isinstance(source_maps, dict):
+        for script in source_maps.get("scripts") or []:
+            if not isinstance(script, dict):
+                continue
+            code = script.get("status_code")
+            error = script.get("error") or (f"HTTP {code}" if isinstance(code, int) and code >= 400 and code not in {404, 410} else None)
+            if error:
+                failed.append({"provider": "source_map_disclosures", "error": f"{script.get('url') or 'script'}: {error}"})
+
+    email_security = payload.get("email_security") or {}
+    if isinstance(email_security, dict):
+        for issue in email_security.get("spf_errors") or []:
+            if not isinstance(issue, dict):
+                continue
+            label = f"spf:{issue.get('domain') or 'record'}"
+            reason = str(issue.get("error") or "SPF lookup incomplete")
+            if reason in {"max_depth_exceeded", "max_lookups_exceeded"}:
+                skipped.append({"provider": label, "reason": reason})
+            else:
+                failed.append({"provider": label, "error": reason})
+
+    if target_type == "domain":
+        reverse = payload.get("censys_reverse_lookup")
+        if isinstance(reverse, dict):
+            if reverse.get("skipped"):
+                skipped.append({"provider": "censys_reverse_lookup", "reason": str(reverse.get("reason") or "Intentionally skipped.")})
+            elif reverse.get("error"):
+                failed.append({"provider": "censys_reverse_lookup", "error": str(reverse["error"])})
+            else:
+                selector_errors = [
+                    item for item in reverse.get("selectors") or []
+                    if isinstance(item, dict) and item.get("error")
+                ]
+                for item in selector_errors:
+                    failed.append({
+                        "provider": "censys_reverse_lookup",
+                        "error": f"{item.get('kind') or 'selector'}: {item['error']}",
+                    })
+                if len(selector_errors) < len(reverse.get("selectors") or []):
+                    completed.append("censys_reverse_lookup")
+        else:
+            skipped.append({"provider": "censys_reverse_lookup", "reason": "Reverse lookups run on submitted seed domains only."})
+
+    ip_details = payload.get("ip_details") if target_type == "domain" else {payload.get("input"): {"asn_info": payload.get("asn_info")}}
+    for ip, detail in (ip_details or {}).items():
+        if not isinstance(detail, dict):
+            continue
+        asn = detail.get("asn_info") or {}
+        if not isinstance(asn, dict):
+            continue
+        for name, marker in (("ipinfo_lite", asn.get("ipinfo")), ("censys_host_enrichment", asn.get("censys_enrichment"))):
+            label = f"{name}:{ip}"
+            if isinstance(marker, dict) and marker.get("skipped"):
+                skipped.append({"provider": label, "reason": str(marker.get("reason") or "Intentionally skipped.")})
+            elif isinstance(marker, dict) and marker.get("error"):
+                failed.append({"provider": label, "error": str(marker["error"])})
+            elif marker is not None or (name == "ipinfo_lite" and asn):
+                # `not_found` is a successful Censys search with no match.
+                completed.append(label)
+
+    if target_type == "domain":
+        details = payload.get("ip_details") or {}
+        for ip in payload.get("ip_enrichment_candidates") or []:
+            if ip not in details:
+                failed.append({"provider": f"ip_enrichment:{ip}", "error": "IP enrichment returned no result."})
+
+    return {
+        "status": "completed" if not failed and not skipped else "partial",
+        "completed": completed,
+        "failed": failed,
+        "skipped": skipped,
+        "counts": {
+            "completed": len(completed),
+            "failed": len(failed),
+            "skipped": len(skipped),
+        },
+    }
+
+
+def _coverage_error(coverage: dict[str, Any]) -> str | None:
+    counts = coverage.get("counts") if isinstance(coverage, dict) else {}
+    failed = int((counts or {}).get("failed") or 0)
+    skipped = int((counts or {}).get("skipped") or 0)
+    if not failed and not skipped:
+        return None
+    parts: list[str] = []
+    if failed:
+        parts.append(f"{failed} provider failure{'s' if failed != 1 else ''}")
+    if skipped:
+        parts.append(f"{skipped} provider skip{'s' if skipped != 1 else ''}")
+    return "Partial provider coverage: " + ", ".join(parts) + "."
+
+
 def clean_target(value: str) -> str:
     """Return the host represented by a domain, IP, or HTTP(S) URL."""
     candidate = str(value or "").strip()
     if not candidate:
         return ""
     if ip_intel.is_ip(candidate):
-        return candidate.lower()
+        try:
+            return public_address(candidate)
+        except UnsafeScanDestination:
+            return ""
 
     # A bare host is also accepted. Prefix it as an authority so optional
     # paths, query strings, and ports are handled the same as a full URL.
@@ -180,7 +393,10 @@ def clean_target(value: str) -> str:
 
     host = host.rstrip(".").lower()
     if ip_intel.is_ip(host):
-        return host
+        try:
+            return public_address(host)
+        except UnsafeScanDestination:
+            return ""
 
     try:
         host = host.encode("idna").decode("ascii")
@@ -266,9 +482,13 @@ def analyze_target(
         else:
             payload = _analyze_domain(normalized_target, logger=logger, profile=profile)
             if profile.reverse_lookups:
-                payload["censys_reverse_lookup"] = _reverse_lookup(
-                    normalized_target, payload, logger=logger
-                )
+                try:
+                    payload["censys_reverse_lookup"] = _reverse_lookup(
+                        normalized_target, payload, logger=logger
+                    )
+                except Exception as exc:
+                    payload["censys_reverse_lookup"] = {"error": str(exc)}
+                    _log(logger, "warning", f"Censys reverse lookup failed for {normalized_target}: {exc}")
 
     payload["scan_depth"] = depth
     payload["discovered_from"] = discovered_from
@@ -281,12 +501,13 @@ def analyze_target(
     if target_type == "domain":
         discovered_targets = _extract_discovered_targets(payload, normalized_target)
 
+    coverage = provider_coverage(payload, target_type=target_type)
+    payload["provider_coverage"] = coverage
     helpers = build_helper_rows(payload)
 
-    # Persist the analysed result into the global intel store (db/intel_db.py) so
-    # the pool and correlation graph populate on every ingest. The case-layer run
-    # is saved separately by the caller; this is best-effort and must never break
-    # the ingest, so any failure is logged and swallowed.
+    # Persist the analysed result into the global intel store (db/intel_db.py).
+    # The case-layer raw run is saved separately by the caller for recovery.
+    persistence: dict[str, Any]
     try:
         from datetime import datetime, timezone
 
@@ -296,11 +517,9 @@ def analyze_target(
         payload.setdefault("type", target_type)
         payload.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
         search_id = intel_db.save_search(payload)
-        lookup = payload.get("censys_reverse_lookup")
-        if isinstance(lookup, dict) and lookup.get("selectors"):
-            from db import discovery_store
-
-            discovery_store.record_reverse_lookup(search_id, lookup)
+        if not search_id:
+            raise RuntimeError("Intel store did not return a search identifier.")
+        persistence = {"status": "saved", "search_id": str(search_id)}
     except Exception as exc:  # pragma: no cover - defensive; correlation is rebuildable
         # Log the originating frame (file:line), not just the message: this save
         # is swallowed so an ingest never breaks, but a bare "'list' object has
@@ -311,7 +530,34 @@ def analyze_target(
         if tb:
             last = tb[-1]
             frame = f" at {last.filename.split('/')[-1]}:{last.lineno} in {last.name}()"
-        _log(logger, "warning", f"Intel store save failed for {normalized_target}: {exc}{frame}")
+        message = f"Intel store save failed for {normalized_target}: {exc}{frame}"
+        persistence = {"status": "failed", "error": message}
+        _log(logger, "warning", message)
+
+    lookup = payload.get("censys_reverse_lookup")
+    if persistence["status"] == "saved" and isinstance(lookup, dict) and lookup.get("selectors"):
+        try:
+            from db import discovery_store
+
+            discovery_store.record_reverse_lookup(search_id, lookup)
+        except Exception as exc:
+            message = f"Reverse-lookup projection failed for {normalized_target}: {exc}"
+            persistence["reverse_lookup"] = {"status": "failed", "error": message}
+            _log(logger, "warning", message)
+
+    payload["persistence"] = persistence
+    if persistence["status"] != "saved":
+        status = "failed"
+        error = str(persistence.get("error") or "Intel store save failed.")
+    elif coverage["status"] == "partial" or persistence.get("reverse_lookup", {}).get("status") == "failed":
+        status = "partial"
+        error = " ".join(filter(None, (
+            _coverage_error(coverage),
+            persistence.get("reverse_lookup", {}).get("error"),
+        )))
+    else:
+        status = "completed"
+        error = None
 
     return AnalysisRun(
         target=target,
@@ -325,6 +571,8 @@ def analyze_target(
         payload=payload,
         discovered_targets=discovered_targets,
         helpers=helpers,
+        status=status,
+        error=error,
     )
 
 
@@ -374,6 +622,7 @@ def _analyze_domain(
         spf_details = signal_dns.collect_spf_details(domain, txt_records=txt_records)
         email_security["spf_includes"] = spf_details.get("includes", [])
         email_security["spf_records"] = spf_details.get("records", [])
+        email_security["spf_errors"] = spf_details.get("errors", [])
         # Two shapes, deliberately, because two consumers need different ones.
         #
         # signal_dns returns {"rua": [...], "ruf": [...]}. utils/pairwise.py
@@ -423,10 +672,9 @@ def _analyze_domain(
             if (page_meta.get("script_urls") or page_meta.get("script_assets"))
             else (page_meta.get("final_url") or domain)
         )
-        page_meta["source_map_urls"] = _collect_source_map_urls(
-            signal_web.fetch_source_map_disclosures(source_map_target)
-        )
-        return {"page_metadata": page_meta}
+        disclosures = signal_web.fetch_source_map_disclosures(source_map_target)
+        page_meta["source_map_urls"] = _collect_source_map_urls(disclosures)
+        return {"page_metadata": page_meta, "source_map_disclosures": disclosures}
 
     def _parity_origin_candidates() -> dict[str, Any]:
         # The three probes are independent DNS sweeps and used to run in
@@ -497,6 +745,7 @@ def _analyze_domain(
             # Context cannot be entered by two threads at once.
             ctx = contextvars.copy_context()
             parity_futures[parity_pool.submit(ctx.run, _run_parity_step, logger, domain, label, step)] = label
+        collector_failures: list[dict[str, str]] = []
         for fut in as_completed(parity_futures):
             label = parity_futures[fut]
             try:
@@ -509,6 +758,10 @@ def _analyze_domain(
                 # single unreachable legal-pages URL. Logged at warning so it
                 # stays visible rather than silently degrading.
                 _log(logger, "warning", f"  parity[{domain}]: {label} failed: {exc}")
+                collector_failures.append({"provider": label, "error": str(exc)})
+
+    if collector_failures:
+        payload["collector_failures"] = collector_failures
 
     # Pure CPU over the NS records the SERVICES fan-out already fetched, so it
     # stays on this thread rather than costing a worker.
@@ -523,6 +776,10 @@ def _analyze_domain(
     payload["nameserver_analysis"].update(
         _nameserver_delegation_check(nameservers, (payload.get("whois") or {}).get("nameservers"))
     )
+    # Basic's list is the actual public, non-Cloudflare enrichment schedule.
+    # The later union with DNS A addresses is for evidence discovery and can
+    # include intentionally un-enriched Cloudflare edges.
+    payload["ip_enrichment_candidates"] = list(payload.get("non_cf_ips") or [])
     payload["non_cf_ips"] = sorted({*payload.get("non_cf_ips", []), *dns_records.get("A", [])})
     payload["comparison_labels"] = {
         "primary": domain,
@@ -912,7 +1169,7 @@ def _provider_hits(payload: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def _collect_source_map_urls(payload: dict[str, Any]) -> list[str]:
-    entries = payload.get("entries", []) or []
+    entries = payload.get("entries") or payload.get("scripts") or []
     urls: list[str] = []
     seen: set[str] = set()
     for entry in entries:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import socket
 
 import db.intel_db as intel_db
 import sources.signal_web as sw
@@ -18,6 +19,13 @@ from sources.signal_web import (
 
 
 class SignalWebTests(unittest.TestCase):
+    def test_missing_optional_mail_host_is_a_no_match(self) -> None:
+        missing = socket.gaierror(socket.EAI_NONAME, "host not found")
+        wrapped = RuntimeError("connection failed")
+        wrapped.__cause__ = missing
+        self.assertTrue(sw._missing_dns_name(wrapped))
+        self.assertFalse(sw._missing_dns_name(TimeoutError("request timed out")))
+
     def test_extract_page_enrichment(self) -> None:
         html = """
         <html lang="en">

@@ -281,6 +281,40 @@ class IntelDbTests(unittest.TestCase):
         intel_db.reset_schema_cache()
         intel_db.init_db()
 
+    def test_ct_source_and_retrieval_dates_are_stored_separately(self) -> None:
+        intel_db.save_search({
+            "input": "example.org", "type": "domain",
+            "timestamp": "2026-09-23T12:00:00+00:00",
+            "crt_sh": {"certs": [{
+                "id": 123, "issuer": "Test CA", "sans": ["example.org"],
+                "not_before": "2019-01-01", "not_after": "2099-01-01",
+                "source_observed_at": "2020-01-02T03:04:05+00:00",
+            }]},
+        })
+        with psycopg.connect(TEST_DATABASE_URL) as conn:
+            row = conn.execute(
+                "SELECT not_before, not_after, source_observed_at, retrieved_at, observed_at FROM ct_certs"
+            ).fetchone()
+        self.assertEqual(row, (
+            "2019-01-01", "2099-01-01", "2020-01-02T03:04:05+00:00",
+            "2026-09-23T12:00:00+00:00", "2026-09-23T12:00:00+00:00",
+        ))
+
+    def test_related_page_total_counts_only_requested_hops(self) -> None:
+        with psycopg.connect(TEST_DATABASE_URL) as conn:
+            conn.execute(
+                "INSERT INTO entities (kind, value, registrable_domain) VALUES ('domain', 'example.org', 'example.org')"
+            )
+            conn.execute(
+                """INSERT INTO graph_paths
+                   (registrable_domain, target, hops, min_hop_score, chain)
+                   VALUES ('example.org', 'direct.org', 1, 10, '[]'),
+                          ('example.org', 'indirect.org', 2, 8, '[]')"""
+            )
+        page = intel_db.related_through_page("example.org", min_hops=2)
+        self.assertEqual(page["total"], 1)
+        self.assertEqual([row["target"] for row in page["related"]], ["indirect.org"])
+
     def test_graph_dirty_state_is_durable(self) -> None:
         self.assertTrue(intel_db.clusters_dirty())
 
