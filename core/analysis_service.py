@@ -4,6 +4,7 @@ import contextvars
 import csv
 import io
 import json
+import re
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,6 +12,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from core import basic
 from core import ip_intel
@@ -150,7 +152,46 @@ class AnalysisRun:
 
 
 def clean_target(value: str) -> str:
-    return ip_intel.clean_target(value).strip().lower()
+    """Return the host represented by a domain, IP, or HTTP(S) URL."""
+    candidate = str(value or "").strip()
+    if not candidate:
+        return ""
+    if ip_intel.is_ip(candidate):
+        return candidate.lower()
+
+    # A bare host is also accepted. Prefix it as an authority so optional
+    # paths, query strings, and ports are handled the same as a full URL.
+    if candidate.startswith("//"):
+        candidate = f"https:{candidate}"
+    elif "://" not in candidate:
+        candidate = f"https://{candidate}"
+
+    try:
+        parsed = urlsplit(candidate)
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return ""
+        # Accessing .port also rejects malformed and out-of-range ports.
+        _ = parsed.port
+        host = parsed.hostname
+    except ValueError:
+        return ""
+    if not host:
+        return ""
+
+    host = host.rstrip(".").lower()
+    if ip_intel.is_ip(host):
+        return host
+
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return ""
+    if len(host) > 253 or any(
+        not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+        for label in host.split(".")
+    ):
+        return ""
+    return host
 
 
 def detect_target_type(value: str) -> str:

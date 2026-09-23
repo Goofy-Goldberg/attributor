@@ -461,11 +461,33 @@ def _job_summary(row: dict[str, Any]) -> str:
     return f"{completed} of {total} targets completed."
 
 
-def parse_submission(target: str | None = None, csv_content: bytes | None = None) -> tuple[list[dict[str, Any]], str]:
+def parse_submission(
+    target: str | None = None,
+    csv_content: bytes | None = None,
+    targets: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], str]:
     if csv_content:
-        targets = parse_csv_targets(csv_content)
-        inputs = normalize_inputs(targets)
+        csv_targets = parse_csv_targets(csv_content)
+        inputs = normalize_inputs(csv_targets)
         return inputs, "csv"
+    if targets is not None:
+        inputs: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for index, raw_target in enumerate(targets, start=1):
+            normalized = clean_target(raw_target)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            inputs.append(
+                {
+                    "input_value": raw_target,
+                    "normalized_target": normalized,
+                    "target_type": "ip" if ip_intel.is_ip(normalized) else "domain",
+                    "upload_row": index,
+                    "source": "manual_url",
+                }
+            )
+        return inputs, "manual_urls"
     if target:
         normalized = clean_target(target)
         if not normalized:

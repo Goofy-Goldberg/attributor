@@ -208,20 +208,25 @@ def _ingest_response(identifiers: dict[str, str], *, label: str | None, count: i
 
 @app.post("/api/ingest")
 async def api_ingest(request: Request) -> JSONResponse:
-    """Add a domain / IP / CSV to the global pool. Runs the analysis pipeline;
-    the results join the one shared correlation graph (no case scoping). An
-    optional `label` is just a free-text tag on the ingest. Poll the returned
-    job for progress; connections then surface via the /api/graph/* endpoints.
+    """Add URLs, domains, IPs, or a CSV to the global pool. URL paths are
+    reduced to their host before analysis. Results join the shared correlation
+    graph. An optional `label` is just a free-text tag on the ingest. Poll the
+    returned job for progress; connections surface via the /api/graph/* endpoints.
     """
     content_type = (request.headers.get("content-type") or "").lower()
     target: str | None = None
+    targets: list[str] | None = None
     csv_content: bytes | None = None
     label: str | None = None
 
     if "application/json" in content_type:
         payload = await request.json()
-        target = str((payload or {}).get("target") or "").strip() or None
-        label = str((payload or {}).get("label") or "").strip() or None
+        payload = payload if isinstance(payload, dict) else {}
+        target = str(payload.get("target") or "").strip() or None
+        raw_targets = payload.get("targets")
+        if isinstance(raw_targets, list):
+            targets = [str(value).strip() for value in raw_targets if str(value).strip()]
+        label = str(payload.get("label") or "").strip() or None
     elif "multipart/form-data" in content_type:
         form = await request.form()
         target = str(form.get("target") or "").strip() or None
@@ -232,9 +237,9 @@ async def api_ingest(request: Request) -> JSONResponse:
     else:
         raise HTTPException(status_code=415, detail="Use JSON or multipart form data.")
 
-    inputs, input_mode = parse_submission(target=target, csv_content=csv_content)
+    inputs, input_mode = parse_submission(target=target, csv_content=csv_content, targets=targets)
     if not inputs:
-        raise HTTPException(status_code=400, detail="Submit a domain, IP, or CSV with at least one valid target.")
+        raise HTTPException(status_code=400, detail="Submit a URL, domain, IP, or CSV with at least one valid target.")
 
     identifiers = runtime.submit_case(inputs, input_mode=label or input_mode)
     return _ingest_response(identifiers, label=label, count=len(inputs))

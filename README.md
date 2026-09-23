@@ -215,7 +215,7 @@ There is no case API — everything is the global pool and its connections.
 
 ### Ingestion
 
-- `POST /api/ingest` — add a domain / IP / CSV to the pool. JSON `{"target": "...", "label": "..."}` or multipart with a CSV `file`. `label` is an optional free-text tag on the ingest; it scopes nothing. Returns a `job_id` to poll. The scanned targets join the one shared correlation graph.
+- `POST /api/ingest` — add URLs, domains, IPs, or a CSV to the pool. JSON accepts `{"target": "...", "label": "..."}` for one target, or `{"targets": ["https://example.com/page", "example.org"], "label": "..."}` for a manual list; multipart with a CSV `file` is also supported. URL paths and query strings are accepted, but each URL is scanned by hostname. `label` is an optional free-text tag on the ingest; it scopes nothing. Returns a `job_id` to poll. The scanned targets join the one shared correlation graph.
 - `GET /api/jobs/{job_id}` — poll live ingest progress (stage, percent, logs).
 
 #### Ingestion pipeline tuning
