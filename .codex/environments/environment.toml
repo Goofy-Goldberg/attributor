@@ -1,0 +1,15 @@
+version = 1
+name = "Attributor"
+
+[setup]
+script = ""
+
+[[actions]]
+name = "Run development containers"
+icon = "run"
+command = "docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build"
+
+[[actions]]
+name = "Stop development containers"
+icon = "tool"
+command = "docker compose -f docker-compose.yml -f docker-compose.dev.yml down"
