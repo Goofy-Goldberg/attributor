@@ -1,8 +1,18 @@
-import { CheckCircle2Icon, CircleAlertIcon, FileSpreadsheetIcon, ListPlusIcon } from "lucide-react";
+import { CheckCircle2Icon, CircleAlertIcon, CloudDownloadIcon, FileSpreadsheetIcon, ListPlusIcon } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
-import { formatDate, formatPercent, isTerminalStatus } from "@/api.js";
+import { fetchJson, formatDate, formatPercent, isTerminalStatus } from "@/api.js";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
@@ -14,6 +24,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { postIngest, useJobs } from "@/features/jobs.jsx";
+import { authClient } from "@/lib/auth-client.js";
 
 // Links, domains and IPs arrive pasted from anywhere — one per line, but also
 // comma- or space-separated lists. URLs never contain raw whitespace, so
@@ -24,6 +35,8 @@ function parseTargets(text) {
 
 export default function IngestSheet() {
   const { sheetOpen, setSheetOpen, addJob, jobs, snapshots, jobsError, clearFinished, userId } = useJobs();
+  const session = authClient.useSession();
+  const isAdmin = session.data?.user?.role === "admin";
   const [mode, setMode] = useState("paste");
   const [text, setText] = useState("");
   const [file, setFile] = useState(null);
@@ -175,6 +188,8 @@ export default function IngestSheet() {
               </Button>
             </form>
 
+            {isAdmin ? <OpenCtiImport /> : null}
+
             {jobsError ? <p className="text-destructive text-sm" role="alert">Could not refresh scans: {jobsError}</p> : null}
 
             {jobs.length > 0 ? (
@@ -208,6 +223,83 @@ export default function IngestSheet() {
         </div>
       </SheetContent>
     </Sheet>
+  );
+}
+
+// Same sweep as `scripts/ingest_opencti_channels.py`: every OpenCTI website
+// channel, skipping ones already in the pool. The server submits the first
+// batch before answering and the rest one after another; later batches show
+// up in the scan list below as the jobs poll picks them up.
+function OpenCtiImport() {
+  const { addJob } = useJobs();
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const runImport = async () => {
+    setBusy(true);
+    const pending = toast.loading("Fetching website channels from OpenCTI…");
+    try {
+      // Paging through every channel on OpenCTI can outlast the default timeout.
+      const payload = await fetchJson("/api/ingest/opencti", { method: "POST", timeoutMs: 5 * 60 * 1000 });
+      const skipped = payload?.skipped
+        ? ` ${payload.skipped} already in the pool were skipped; their tiers and labels were refreshed.`
+        : "";
+      if (!payload?.job_id) {
+        toast.success("Nothing new on OpenCTI", {
+          id: pending,
+          description: `All ${payload?.channels ?? 0} website channels are already in the pool.${skipped}`,
+        });
+        return;
+      }
+      const batches = payload.batches > 1 ? ` in ${payload.batches} batches` : "";
+      addJob({
+        id: payload.job_id,
+        title: payload.batches > 1 ? `OpenCTI import · batch 1 of ${payload.batches}` : "OpenCTI import",
+        count: payload.job?.total_targets ?? payload.accepted,
+      });
+      toast.success("OpenCTI import started", {
+        id: pending,
+        description: `Scanning ${payload.accepted} new channel${payload.accepted === 1 ? "" : "s"}${batches}.${skipped}`,
+      });
+    } catch (err) {
+      toast.error("OpenCTI import failed", { id: pending, description: err.message || "Could not reach OpenCTI." });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <Separator />
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex min-w-0 flex-col gap-1">
+          <h3 className="text-sm font-medium">Import from OpenCTI</h3>
+          <p className="text-muted-foreground text-xs">
+            Scan every OpenCTI website channel that isn&apos;t in the pool yet, and refresh tiers and labels on the
+            ones that are.
+          </p>
+        </div>
+        <Button disabled={busy} onClick={() => setConfirmOpen(true)} size="sm" variant="outline">
+          {busy ? <Spinner data-icon="inline-start" /> : <CloudDownloadIcon data-icon="inline-start" />}
+          {busy ? "Importing…" : "Import"}
+        </Button>
+      </div>
+      <AlertDialog onOpenChange={setConfirmOpen} open={confirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Import website channels from OpenCTI?</AlertDialogTitle>
+            <AlertDialogDescription>
+              New channels are scanned in batches of 250, one batch at a time, so a large import can run for hours.
+              Other scans still get a turn between batches.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={runImport}>Import</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
   );
 }
 

@@ -9,6 +9,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from fastapi import Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.testclient import TestClient
+import pytest
 
 import cases.case_app as case_app
 
@@ -690,3 +691,98 @@ def test_graph_recompute_endpoint(monkeypatch) -> None:
     body = response.json()
     assert body["status"] == "recomputed"
     assert body["searches"] == 3
+
+
+def _stub_opencti(monkeypatch, domain_data):
+    from integrations import opencti_ingest, opencti_sweep
+
+    monkeypatch.setattr(opencti_ingest, "fetch_all_website_channel_data", lambda: domain_data)
+    monkeypatch.setattr(opencti_sweep, "set_domain_tier", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(opencti_sweep, "existing_search_targets", lambda _targets: {"old.example"})
+    monkeypatch.setattr(opencti_sweep, "get_latest_search_id_for_target", lambda _domain: None)
+
+
+def test_opencti_import_submits_new_channels_and_hands_the_rest_to_a_thread(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    _stub_opencti(monkeypatch, {
+        "old.example": {"labels": [], "tier": 1},
+        "new.example": {"labels": [], "tier": None},
+    })
+    captured: dict = {}
+    started: list = []
+
+    def _submit(inputs, **kwargs):
+        captured.update(kwargs)
+        captured["targets"] = [item["normalized_target"] for item in inputs]
+        return {"case_id": "case-1", "job_id": "job-1"}
+
+    # Stands in for batches 2..N; it never releases the lock, like a sweep still running.
+    monkeypatch.setattr(case_app, "_run_opencti_sweep_batches", lambda *args: started.append(args))
+    monkeypatch.setattr(case_app.runtime, "submit_case", _submit)
+    monkeypatch.setattr(case_app, "get_job", lambda _job_id: None)
+
+    with TestClient(case_app.app) as client:
+        response = client.post("/api/ingest/opencti")
+        # The sweep holds the lock until its background thread finishes.
+        second = client.post("/api/ingest/opencti")
+    case_app._opencti_sweep_lock.release()
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["job_id"] == "job-1"
+    assert (body["channels"], body["skipped"], body["accepted"], body["batches"]) == (2, 1, 1, 1)
+    assert captured["targets"] == ["new.example"]
+    assert captured["input_mode"] == "opencti_website_full"
+    assert captured["created_by"] == "test-admin"
+    deadline = time.monotonic() + 2
+    while not started and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert started and started[0][3] == "job-1"
+    assert second.status_code == 409
+
+
+def test_opencti_import_with_nothing_new_submits_nothing(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    _stub_opencti(monkeypatch, {"old.example": {"labels": [], "tier": None}})
+    monkeypatch.setattr(case_app.runtime, "submit_case", lambda *_a, **_k: pytest.fail("nothing to scan"))
+
+    with TestClient(case_app.app) as client:
+        response = client.post("/api/ingest/opencti")
+
+    assert response.status_code == 200
+    assert response.json()["job_id"] is None
+    assert case_app._opencti_sweep_lock.acquire(blocking=False)
+    case_app._opencti_sweep_lock.release()
+
+
+def test_opencti_import_reports_an_unreachable_opencti(monkeypatch) -> None:
+    from integrations import opencti_ingest
+
+    _quiet(monkeypatch)
+
+    def _fail():
+        raise RuntimeError("OPENCTI_URL or OPENCTI_TOKEN not set")
+
+    monkeypatch.setattr(opencti_ingest, "fetch_all_website_channel_data", _fail)
+
+    with TestClient(case_app.app) as client:
+        response = client.post("/api/ingest/opencti")
+
+    assert response.status_code == 502
+    assert "OPENCTI_URL" in response.json()["detail"]
+    assert case_app._opencti_sweep_lock.acquire(blocking=False)
+    case_app._opencti_sweep_lock.release()
+
+
+def test_opencti_import_requires_admin(monkeypatch) -> None:
+    _quiet(monkeypatch, authenticated=False)
+
+    async def _user(_request):
+        return {"sub": "user-1", "role": "user"}
+
+    monkeypatch.setattr(case_app, "authenticate_request", _user)
+
+    with TestClient(case_app.app) as client:
+        response = client.post("/api/ingest/opencti")
+
+    assert response.status_code == 403

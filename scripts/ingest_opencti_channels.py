@@ -1,8 +1,7 @@
 """ingest_opencti_channels.py — sweep every OpenCTI website Channel into the pool.
 
 Fetches *all* Channel SDOs on OpenCTI with channel_types containing
-"website" (no 100-channel cap, unlike the frontend's "ingest website
-channels" button), runs each resolved domain through the same full
+"website", runs each resolved domain through the same full
 ingestion pipeline as a normal case submission (core/basic.py's analyze()
 plus analysis_service's parity enrichments, subdomain/sibling follow-ups,
 and db/intel_db.py correlation).
@@ -16,7 +15,9 @@ Two kinds of OpenCTI label data get attached to each domain:
 - the full label list is attached to the scan's own result as
   `opencti_labels`, same as before — informational only.
 
-Meant to run inside the app container, not through the frontend:
+The same sweep (integrations/opencti_sweep.py) backs the "Import from
+OpenCTI" button in the web UI. This command is the blocking, operator-run
+form, with --dry-run / --rescan-existing / --batch-size:
 
     docker compose exec ip-intel python -m scripts.ingest_opencti_channels
 
@@ -29,20 +30,11 @@ import argparse
 import logging
 import os
 import sys
-import time
 
 from cases.case_runtime import CaseRuntime
-from cases.case_store import get_job
-from core.analysis_service import clean_target, normalize_inputs
-from db.intel_db import (
-    existing_search_targets,
-    get_latest_search_id_for_target,
-    rebuild_clusters,
-    registrable_domain,
-    save_search_fields,
-    set_domain_tier,
-)
+from db.intel_db import rebuild_clusters
 from integrations.opencti_ingest import fetch_all_website_channel_data
+from integrations.opencti_sweep import INPUT_MODE, prepare_sweep, run_batches, split_batches
 
 
 def _configure_logging() -> None:
@@ -173,161 +165,64 @@ def main() -> None:
             print(f"  {domain}  ({tier_text}){labels_text}")
         return
 
-    # Tier is durable, per-domain classification, independent of any one
-    # scan's success — set it up front so it's recorded even if a domain's
-    # analysis below fails or times out. domain_tiers is keyed on the
-    # *registrable* domain (same rollup key domain_profile/graph lookups
-    # use), so a channel resolving to a subdomain still needs collapsing to
-    # its apex here, or the tier would be stored under a key nothing ever
-    # looks up.
-    print("Recording domain tiers...")
-    tier_written = 0
-    for domain, entry in domain_data.items():
-        if entry["tier"] is None:
-            continue
-        apex = registrable_domain(clean_target(domain))
-        if not apex:
-            continue
-        set_domain_tier(apex, entry["tier"], source="opencti")
-        tier_written += 1
-    print(f"  set tier on {tier_written} domain(s).")
+    print("Recording domain tiers and checking which channels are already in the pool...")
+    plan = prepare_sweep(domain_data, rescan_existing=args.rescan_existing)
+    print(f"  set tier on {plan.tiers_written} domain(s).")
+    if plan.skipped:
+        print(
+            f"Skipping {plan.skipped} channel(s) already in the DB "
+            f"(refreshed labels on {plan.labels_refreshed}). {len(plan.to_scan)} new channel(s) to scan."
+        )
 
-    inputs = normalize_inputs(list(domain_data.keys()))
-    if not inputs:
-        print("No valid domains after normalization. Nothing to do.")
-        return
-
-    # Labels are keyed by clean_target() so lookups line up exactly with the
-    # normalized_target each search was actually saved under.
-    normalized_labels = {
-        clean_target(domain): entry["labels"]
-        for domain, entry in domain_data.items()
-        if entry["labels"]
-    }
-
-    # Skip channels already in the pool: the analysis pipeline is the expensive
-    # part, and a channel with an existing search has already been through it.
-    # Tiers were recorded above for *every* channel regardless, and labels for
-    # skipped channels are refreshed here (they already have a search to attach
-    # to), so only the re-scan is avoided — not the durable metadata. --rescan-
-    # existing forces a full re-run.
-    if args.rescan_existing:
-        new_inputs = inputs
-    else:
-        already = existing_search_targets([item["normalized_target"] for item in inputs])
-        new_inputs = [item for item in inputs if item["normalized_target"] not in already]
-        skipped = len(inputs) - len(new_inputs)
-        if skipped:
-            skipped_inputs = [item for item in inputs if item["normalized_target"] in already]
-            attached, missing = _attach_labels(skipped_inputs, normalized_labels)
-            print(
-                f"Skipping {skipped} channel(s) already in the DB "
-                f"(refreshed labels on {attached}). {len(new_inputs)} new channel(s) to scan."
-            )
-
-    if not new_inputs:
+    if not plan.to_scan:
         print("No new channels to scan.")
         print("Rebuilding graph materializations...")
         graph_counts = rebuild_clusters()
         print(f"  graph rebuild: {graph_counts}")
         return
 
-    inputs = new_inputs
-
     # Split into sequential batches so each case completes and persists before
     # the next starts. With thousands of domains this keeps a single job from
     # running for many hours, makes progress durable (a crash only loses the
     # in-flight batch), and attaches labels incrementally rather than only at
-    # the very end. batch_size <= 0 means "one case for everything".
-    batch_size = args.batch_size if args.batch_size and args.batch_size > 0 else len(inputs)
-    batches = [inputs[i : i + batch_size] for i in range(0, len(inputs), batch_size)]
-
+    # the very end.
+    batches = split_batches(plan.to_scan, args.batch_size)
     runtime = CaseRuntime()
-    total_attached = 0
-    total_missing = 0
-    failed_batches = 0
-    partial_batches = 0
-
-    for batch_num, batch_inputs in enumerate(batches, 1):
-        print(
-            f"\n=== Batch {batch_num}/{len(batches)} "
-            f"({len(batch_inputs)} domain(s)) ==="
-        )
-        status = _run_batch(runtime, batch_inputs, poll_interval=args.poll_interval)
-        if status == "failed":
-            failed_batches += 1
-        elif status == "partial":
-            partial_batches += 1
-
-        attached, missing = _attach_labels(batch_inputs, normalized_labels)
-        total_attached += attached
-        total_missing += missing
-        print(f"  attached labels to {attached} domain(s); {missing} had labels but no matching search result.")
+    result = run_batches(
+        lambda batch_inputs: runtime.submit_case(batch_inputs, input_mode=INPUT_MODE),
+        batches,
+        plan.normalized_labels,
+        poll_interval=args.poll_interval,
+        log=lambda message: print(message, flush=True),
+        on_progress=_ProgressPrinter(),
+    )
 
     print(
-        f"\nAll batches done: {len(batches) - partial_batches - failed_batches}/{len(batches)} completed, "
-        f"{partial_batches} partial, {failed_batches} failed. Attached labels to {total_attached} domain(s) "
-        f"({total_missing} unmatched)."
+        f"\nAll batches done: {result.completed}/{result.batches} completed, "
+        f"{result.partial} partial, {result.failed} failed. Attached labels to {result.labels_attached} domain(s) "
+        f"({result.labels_missing} unmatched)."
     )
 
     print("Rebuilding graph materializations...")
     graph_counts = rebuild_clusters()
     print(f"  graph rebuild: {graph_counts}")
 
-    if failed_batches or partial_batches:
+    if result.failed or result.partial:
         sys.exit(1)
 
 
-def _run_batch(runtime: CaseRuntime, batch_inputs: list, *, poll_interval: float) -> str:
-    """Submit one batch as a case and block until it finishes, printing progress.
+class _ProgressPrinter:
+    """Print a progress line only when the job's counts or stage actually moved,
+    so the poll cadence no longer floods the log with identical snapshots."""
 
-    Returns the job's terminal status ("completed", "partial", or "failed").
-    A partial or failed batch does not abort the sweep. The caller reports
-    separate totals at the end.
-    """
-    identifiers = runtime.submit_case(batch_inputs, input_mode="opencti_website_full")
-    case_id, job_id = identifiers["case_id"], identifiers["job_id"]
-    print(f"Submitted case {case_id} (job {job_id}). Waiting for it to finish...")
+    def __init__(self) -> None:
+        self._last = None
 
-    last_signature = None
-    while True:
-        job = get_job(job_id)
-        if job is None:
-            print("error: job disappeared mid-run", file=sys.stderr)
-            return "failed"
-        # Only emit a line when the counts/stage actually moved, so the poll
-        # cadence no longer floods the log with identical snapshots.
+    def __call__(self, job: dict) -> None:
         signature = _progress_signature(job)
-        if signature != last_signature:
+        if signature != self._last:
             _print_progress(job)
-            last_signature = signature
-        if job.get("status") in ("completed", "partial", "failed"):
-            break
-        time.sleep(poll_interval)
-
-    status = job.get("status")
-    print(f"Case {status}.")
-    if job.get("error"):
-        print(f"  error: {job['error']}")
-    return status
-
-
-def _attach_labels(batch_inputs: list, normalized_labels: dict) -> tuple[int, int]:
-    """Attach OpenCTI labels to the just-scanned domains in this batch."""
-    attached = 0
-    missing = 0
-    for item in batch_inputs:
-        domain = item["normalized_target"]
-        labels = normalized_labels.get(domain)
-        if not labels:
-            continue
-        sid = get_latest_search_id_for_target(domain)
-        if sid is None:
-            missing += 1
-            continue
-        save_search_fields(sid, {"opencti_labels": labels})
-        attached += 1
-    return attached, missing
+            self._last = signature
 
 
 if __name__ == "__main__":

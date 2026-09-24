@@ -31,7 +31,8 @@ React + FastAPI application for domain and IP OSINT, origin discovery, and infra
 | `db/intel_db.py` | PostgreSQL schema, persistence, and history for raw intel runs |
 | `scripts/migrate_sqlite_to_postgres.py` | One-off migration of a legacy SQLite intel database into PostgreSQL |
 | `scripts/backfill_correlation.py` | Rebuild the derived correlation graph (entities/selectors/observations/edges/clusters) from all stored intel |
-| `scripts/ingest_opencti_channels.py` | Docker-command-triggered sweep of *every* OpenCTI website Channel through the full ingestion pipeline, tier-1..tier-5 classification included (see [OpenCTI Ingestion](#opencti-ingestion)) |
+| `scripts/ingest_opencti_channels.py` | Docker-command form of the sweep of *every* OpenCTI website Channel through the full ingestion pipeline, tier-1..tier-5 classification included (see [OpenCTI Ingestion](#opencti-ingestion)) |
+| `integrations/opencti_sweep.py` | The OpenCTI sweep steps (tiers, skip-existing, sequential batches, labels) shared by the Docker script and the "Import from OpenCTI" button |
 | `sources/signal_dns.py` | DNS and email-security signals (SPF, DKIM, DMARC, MX) |
 | `sources/signal_transport.py` | TLS and SSH certificate parsing |
 | `sources/signal_web.py` | Web page metadata extraction (favicons, tracking IDs, headers) |
@@ -257,6 +258,7 @@ token. Graph recompute and graph email require the `admin` role.
 ### Ingestion
 
 - `POST /api/ingest` — add URLs, domains, IPs, or a CSV to the pool. JSON accepts `{"target": "...", "label": "..."}` for one target, or `{"targets": ["https://example.com/page", "example.org"], "label": "..."}` for a manual list; multipart with a CSV `file` is also supported. URL paths and query strings are accepted, but each URL is scanned by hostname. An optional `label` is attached to every submitted registrable domain with the job ID, authenticated user ID, and time. Repeating a scan with another label adds it to the channel; IP targets have no registrable domain to label. Returns a `job_id` to poll. Targets that reach the intel store join the shared correlation graph.
+- `POST /api/ingest/opencti` — admin only; start the OpenCTI website-channel sweep (see [OpenCTI Ingestion](#opencti-ingestion)). Returns `202` with the first batch's `job_id` plus `channels`, `skipped`, `accepted` and `batches` counts, `200` with `job_id: null` when every channel is already in the pool, `409` while a sweep is running, and `502` when OpenCTI is unreachable or not configured.
 - `GET /api/jobs?status=active|recent&limit=` — shared work queue summaries, newest first. `active` returns queued and running jobs (default limit 5,000); `recent` returns completed, partial, and failed jobs (default limit 50, maximum 200). Each job includes its creator subject and signed display claim when available, the optional ingest label, completed/partial/failed target totals, provider coverage, and timestamps.
 - `GET /api/jobs/{job_id}` — poll live ingest progress (stage, percent, logs) and the durable target outcomes. A `partial` result retains observations that reached storage but records provider failures and intentional skips; a storage failure is `failed` and never claimed as ingested. Raw target payloads remain in the job's internal `search_runs` record for recovery without re-running providers.
 
@@ -677,9 +679,10 @@ Docker, tests, or README conformance.
 
 ## OpenCTI Ingestion
 
-`integrations/opencti_ingest.py` pulls targets from OpenCTI (set `OPENCTI_URL` and `OPENCTI_TOKEN`). OpenCTI website-channel ingestion is intentionally operator-triggered from Docker, not exposed in the web UI:
+`integrations/opencti_ingest.py` pulls targets from OpenCTI (set `OPENCTI_URL` and `OPENCTI_TOKEN`). The website-channel sweep below (`integrations/opencti_sweep.py`) has two triggers:
 
-- **`scripts/ingest_opencti_channels.py`** (below) — every matching Channel, no cap, run as a docker command instead of from the UI, with tier classification.
+- **"Import from OpenCTI"** in the web UI's *Add channels* sheet (admins only; `POST /api/ingest/opencti`) — runs the sweep with the defaults (skip existing channels, batches of 250). The server submits the first batch before answering and returns its job; the remaining batches run one after another on a background thread and appear in the scan list as each starts, followed by a `rebuild_clusters()`. Only one sweep runs at a time (a second click gets `409`), and a restart ends it like any other in-flight job.
+- **`scripts/ingest_opencti_channels.py`** — the same sweep as a blocking Docker command, with `--dry-run`, `--rescan-existing` and `--batch-size`.
 - `_run()` / `restart_ingestion()` / `retry_source_errors()` in `integrations/opencti_ingest.py` — an older worker that separately pulled Domain-Name observables and Channel SDOs and ran them through `core/ip_intel.py`'s CLI engine rather than the current app ingest pipeline (`OPENCTI_INGEST_CHANNELS`, `OPENCTI_INGEST_WORKERS` control it). Nothing in the running app calls `start_background_ingestion()`/`restart_ingestion()` anymore — it's dead code, kept because `tests/test_opencti_ingest.py` still exercises it.
 
 Channel SDOs (STIX 2.1 extension) are resolved to domains the same way in both live paths (`_channel_candidate_domains`): the channel `name` and aliases are used when they parse as a domain/URL, plus any external reference URLs, normalized to bare registrable domains (scheme, path, port, and leading `www.` stripped). Social-media platform domains (facebook.com, x.com, youtube.com, t.me, vk.com, etc.) are skipped per the "non-social media channels" goal.

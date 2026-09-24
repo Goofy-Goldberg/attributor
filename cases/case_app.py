@@ -12,6 +12,7 @@ import mimetypes
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -346,6 +347,111 @@ async def api_ingest(request: Request) -> JSONResponse:
     if label:
         cache.invalidate()
     return _ingest_response(identifiers, label=label, count=len(inputs))
+
+
+# One OpenCTI sweep at a time: a second click while batches are still running
+# would re-submit every channel the first sweep hasn't finished scanning yet.
+_opencti_sweep_lock = threading.Lock()
+OPENCTI_SWEEP_BATCH_SIZE = 250
+
+
+def _run_opencti_sweep_batches(submit, batches, normalized_labels, first_job_id: str) -> None:
+    """Background half of POST /api/ingest/opencti: batches 2..N, then a graph rebuild."""
+    from integrations import opencti_sweep
+
+    try:
+        result = opencti_sweep.run_batches(
+            submit,
+            batches,
+            normalized_labels,
+            poll_interval=5.0,
+            first_job_id=first_job_id,
+            log=lambda message: LOGGER.info("OpenCTI sweep: %s", message.strip()),
+        )
+        LOGGER.info(
+            "OpenCTI sweep finished: %d/%d batches completed, %d partial, %d failed; labels on %d domain(s).",
+            result.completed, result.batches, result.partial, result.failed, result.labels_attached,
+        )
+        intel_db.rebuild_clusters()
+        cache.invalidate()
+    except Exception:  # noqa: BLE001
+        LOGGER.exception("OpenCTI sweep failed")
+    finally:
+        _opencti_sweep_lock.release()
+
+
+@app.post("/api/ingest/opencti")
+async def api_ingest_opencti(request: Request) -> JSONResponse:
+    """Import every OpenCTI website channel into the pool — the same sweep as
+    `scripts/ingest_opencti_channels.py`. Tiers are recorded and labels
+    refreshed for every channel; only channels not already in the pool are
+    scanned, in sequential batches. Returns the first batch's job to poll; the
+    remaining batches appear in the jobs list as each one starts."""
+    if request.state.identity.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access is required.")
+    if not _opencti_sweep_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="An OpenCTI import is already running.")
+
+    handed_off = False
+    try:
+        # Imported lazily so the app starts even when pycti / OpenCTI config is
+        # absent; the dependency is only needed when this button is used.
+        from integrations import opencti_sweep
+        from integrations.opencti_ingest import fetch_all_website_channel_data
+
+        try:
+            domain_data = await asyncio.to_thread(fetch_all_website_channel_data)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"OpenCTI fetch failed: {exc}")
+
+        plan = await asyncio.to_thread(opencti_sweep.prepare_sweep, domain_data)
+        counts = {
+            "channels": plan.channel_count,
+            "tiers": plan.tiers_written,
+            "skipped": plan.skipped,
+            "labels_refreshed": plan.labels_refreshed,
+            "accepted": len(plan.to_scan),
+        }
+        if not plan.to_scan:
+            cache.invalidate()
+            return JSONResponse(content={**counts, "job_id": None, "batches": 0, "status": "nothing_new"})
+
+        identity = request.state.identity
+
+        def submit(batch_inputs):
+            return runtime.submit_case(
+                batch_inputs,
+                input_mode=opencti_sweep.INPUT_MODE,
+                created_by=identity["sub"],
+                created_by_display=_identity_display(identity),
+            )
+
+        batches = opencti_sweep.split_batches(plan.to_scan, OPENCTI_SWEEP_BATCH_SIZE)
+        identifiers = submit(batches[0])
+        threading.Thread(
+            target=_run_opencti_sweep_batches,
+            args=(submit, batches, plan.normalized_labels, identifiers["job_id"]),
+            name="opencti-sweep",
+            daemon=True,
+        ).start()
+        handed_off = True
+    finally:
+        if not handed_off:
+            _opencti_sweep_lock.release()
+
+    job_row = get_job(identifiers["job_id"])
+    return JSONResponse(
+        status_code=202,
+        content=jsonable_encoder(
+            {
+                **counts,
+                "job": build_job_response(job_row) if job_row else {"id": identifiers["job_id"]},
+                "job_id": identifiers["job_id"],
+                "batches": len(batches),
+                "status": "queued",
+            }
+        ),
+    )
 
 
 # ── The pool ─────────────────────────────────────────────────────────────────
