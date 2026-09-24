@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import time
+from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
@@ -12,6 +13,16 @@ from fastapi.testclient import TestClient
 import pytest
 
 import cases.case_app as case_app
+
+
+def test_spa_html_is_revalidated(monkeypatch, tmp_path: Path) -> None:
+    (tmp_path / "index.html").write_text("<html>attributor</html>", encoding="utf-8")
+    monkeypatch.setattr(case_app, "FRONTEND_DIST", tmp_path)
+    _quiet(monkeypatch)
+    with TestClient(case_app.app) as client:
+        response = client.get("/domain/example.org")
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-cache"
 
 
 def _quiet(monkeypatch, *, authenticated: bool = True) -> None:
@@ -753,6 +764,57 @@ def test_opencti_import_with_nothing_new_submits_nothing(monkeypatch) -> None:
     assert response.json()["job_id"] is None
     assert case_app._opencti_sweep_lock.acquire(blocking=False)
     case_app._opencti_sweep_lock.release()
+
+
+def test_opencti_import_limit_reaches_first_batch(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    _stub_opencti(monkeypatch, {
+        "zeta.example": {"labels": [], "tier": None},
+        "beta.example": {"labels": [], "tier": None},
+        "alpha.example": {"labels": [], "tier": None},
+    })
+    captured = []
+    monkeypatch.setattr(case_app.runtime, "submit_case", lambda inputs, **kwargs: captured.extend(
+        item["normalized_target"] for item in inputs
+    ) or {"case_id": "case-1", "job_id": "job-1"})
+    monkeypatch.setattr(case_app, "_run_opencti_sweep_batches", lambda *args: None)
+    monkeypatch.setattr(case_app, "get_job", lambda _job_id: None)
+
+    with TestClient(case_app.app) as client:
+        response = client.post("/api/ingest/opencti", json={"limit": 1})
+    case_app._opencti_sweep_lock.release()
+
+    assert response.status_code == 202
+    assert response.json()["deferred"] == 2
+    assert captured == ["alpha.example"]
+
+
+def test_opencti_import_rejects_invalid_limit(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    with TestClient(case_app.app) as client:
+        response = client.post("/api/ingest/opencti", json={"limit": 0})
+    assert response.status_code == 422
+
+
+def test_opencti_import_defaults_to_ten(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    _stub_opencti(monkeypatch, {
+        f"site{i:02d}.example": {"labels": [], "tier": None} for i in range(11)
+    })
+    captured = []
+    monkeypatch.setattr(case_app.runtime, "submit_case", lambda inputs, **kwargs: captured.extend(inputs) or {
+        "case_id": "case-1", "job_id": "job-1",
+    })
+    monkeypatch.setattr(case_app, "_run_opencti_sweep_batches", lambda *args: None)
+    monkeypatch.setattr(case_app, "get_job", lambda _job_id: None)
+
+    with TestClient(case_app.app) as client:
+        response = client.post("/api/ingest/opencti")
+    case_app._opencti_sweep_lock.release()
+
+    assert response.status_code == 202
+    assert (response.json()["accepted"], response.json()["deferred"]) == (10, 1)
+    assert len(captured) == 10
 
 
 def test_opencti_import_reports_an_unreachable_opencti(monkeypatch) -> None:

@@ -1,0 +1,19 @@
+services:
+  auth:
+    environment:
+      NODE_EXTRA_CA_CERTS: /etc/ssl/certs/athena-caddy-root.crt
+    volumes:
+      - ./certs/athena-caddy-root.crt:/etc/ssl/certs/athena-caddy-root.crt:ro
+
+  ip-intel:
+    ports: !override
+      - "0.0.0.0:19001:8000"
+    networks:
+      - default
+      - shared_net
+      - opencti
+
+networks:
+  opencti:
+    external: true
+    name: opencti_default

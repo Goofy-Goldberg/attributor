@@ -382,13 +382,19 @@ def _run_opencti_sweep_batches(submit, batches, normalized_labels, first_job_id:
 
 @app.post("/api/ingest/opencti")
 async def api_ingest_opencti(request: Request) -> JSONResponse:
-    """Import every OpenCTI website channel into the pool — the same sweep as
-    `scripts/ingest_opencti_channels.py`. Tiers are recorded and labels
-    refreshed for every channel; only channels not already in the pool are
-    scanned, in sequential batches. Returns the first batch's job to poll; the
-    remaining batches appear in the jobs list as each one starts."""
+    """Import up to the requested number of new website channels."""
     if request.state.identity.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access is required.")
+    raw_body = await request.body()
+    try:
+        payload = json.loads(raw_body) if raw_body else {}
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=422, detail="Invalid JSON body.") from None
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="Expected a JSON object.")
+    limit = payload.get("limit", 10)
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 250):
+        raise HTTPException(status_code=422, detail="limit must be an integer from 1 to 250.")
     if not _opencti_sweep_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="An OpenCTI import is already running.")
 
@@ -404,11 +410,12 @@ async def api_ingest_opencti(request: Request) -> JSONResponse:
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"OpenCTI fetch failed: {exc}")
 
-        plan = await asyncio.to_thread(opencti_sweep.prepare_sweep, domain_data)
+        plan = await asyncio.to_thread(opencti_sweep.prepare_sweep, domain_data, limit=limit)
         counts = {
             "channels": plan.channel_count,
             "tiers": plan.tiers_written,
             "skipped": plan.skipped,
+            "deferred": plan.deferred,
             "labels_refreshed": plan.labels_refreshed,
             "accepted": len(plan.to_scan),
         }
@@ -918,4 +925,4 @@ def spa_fallback(full_path: str) -> FileResponse:
     index_file = FRONTEND_DIST / "index.html"
     if not index_file.exists():
         raise HTTPException(status_code=404, detail="Frontend build not found.")
-    return FileResponse(index_file)
+    return FileResponse(index_file, headers={"Cache-Control": "no-cache"})

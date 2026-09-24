@@ -1,6 +1,8 @@
 # Environment & secrets
 .env
 *.env.*
+certs/
+backups/
 
 # Python
 __pycache__/

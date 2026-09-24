@@ -234,20 +234,29 @@ function OpenCtiImport() {
   const { addJob } = useJobs();
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [limit, setLimit] = useState("10");
+  const parsedLimit = Number(limit);
+  const validLimit = Number.isInteger(parsedLimit) && parsedLimit >= 1 && parsedLimit <= 250;
 
   const runImport = async () => {
     setBusy(true);
     const pending = toast.loading("Fetching website channels from OpenCTI…");
     try {
       // Paging through every channel on OpenCTI can outlast the default timeout.
-      const payload = await fetchJson("/api/ingest/opencti", { method: "POST", timeoutMs: 5 * 60 * 1000 });
+      const payload = await fetchJson("/api/ingest/opencti", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ limit: parsedLimit }),
+        timeoutMs: 5 * 60 * 1000,
+      });
       const skipped = payload?.skipped
-        ? ` ${payload.skipped} already in the pool were skipped; their tiers and labels were refreshed.`
+        ? ` ${payload.skipped} already in the pool were skipped.`
         : "";
+      const deferred = payload?.deferred ? ` ${payload.deferred} remain for a later import.` : "";
       if (!payload?.job_id) {
         toast.success("Nothing new on OpenCTI", {
           id: pending,
-          description: `All ${payload?.channels ?? 0} website channels are already in the pool.${skipped}`,
+          description: `No new website channels to import.${skipped}`,
         });
         return;
       }
@@ -259,7 +268,7 @@ function OpenCtiImport() {
       });
       toast.success("OpenCTI import started", {
         id: pending,
-        description: `Scanning ${payload.accepted} new channel${payload.accepted === 1 ? "" : "s"}${batches}.${skipped}`,
+        description: `Scanning ${payload.accepted} new channel${payload.accepted === 1 ? "" : "s"}${batches}.${skipped}${deferred}`,
       });
     } catch (err) {
       toast.error("OpenCTI import failed", { id: pending, description: err.message || "Could not reach OpenCTI." });
@@ -275,8 +284,7 @@ function OpenCtiImport() {
         <div className="flex min-w-0 flex-col gap-1">
           <h3 className="text-sm font-medium">Import from OpenCTI</h3>
           <p className="text-muted-foreground text-xs">
-            Scan every OpenCTI website channel that isn&apos;t in the pool yet, and refresh tiers and labels on the
-            ones that are.
+            Scan new website channels from OpenCTI.
           </p>
         </div>
         <Button disabled={busy} onClick={() => setConfirmOpen(true)} size="sm" variant="outline">
@@ -289,13 +297,23 @@ function OpenCtiImport() {
           <AlertDialogHeader>
             <AlertDialogTitle>Import website channels from OpenCTI?</AlertDialogTitle>
             <AlertDialogDescription>
-              New channels are scanned in batches of 250, one batch at a time, so a large import can run for hours.
-              Other scans still get a turn between batches.
+              Analysis may discover related targets beyond the channel count.
             </AlertDialogDescription>
           </AlertDialogHeader>
+          <Field>
+            <FieldLabel htmlFor="opencti-import-limit">New channels</FieldLabel>
+            <Input
+              id="opencti-import-limit"
+              max={250}
+              min={1}
+              onChange={(event) => setLimit(event.target.value)}
+              type="number"
+              value={limit}
+            />
+          </Field>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={runImport}>Import</AlertDialogAction>
+            <AlertDialogAction disabled={!validLimit || busy} onClick={runImport}>Import</AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

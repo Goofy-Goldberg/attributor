@@ -53,3 +53,23 @@ def test_prepare_sweep_skips_channels_already_in_the_pool(monkeypatch):
     assert [item["normalized_target"] for item in plan.to_scan] == ["new.example"]
     assert (plan.skipped, plan.labels_refreshed) == (1, 1)
     assert saved == {7: {"opencti_labels": ["tier-2"]}}
+
+
+def test_prepare_sweep_limits_new_domains_and_metadata(monkeypatch):
+    tiers = []
+    refreshed = []
+    monkeypatch.setattr(opencti_sweep, "set_domain_tier", lambda domain, tier, source: tiers.append((domain, tier)))
+    monkeypatch.setattr(opencti_sweep, "existing_search_targets", lambda targets: {"alpha.example"})
+    monkeypatch.setattr(opencti_sweep, "attach_labels", lambda *args: refreshed.append(args) or (0, 0))
+
+    plan = opencti_sweep.prepare_sweep({
+        "gamma.example": {"labels": ["tier-3"], "tier": 3},
+        "beta.example": {"labels": ["tier-2"], "tier": 2},
+        "alpha.example": {"labels": ["tier-1"], "tier": 1},
+    }, limit=1)
+
+    assert [item["normalized_target"] for item in plan.to_scan] == ["beta.example"]
+    assert (plan.skipped, plan.deferred, plan.tiers_written) == (1, 1, 1)
+    assert plan.normalized_labels == {"beta.example": ["tier-2"]}
+    assert tiers == [("beta.example", 2)]
+    assert refreshed == []

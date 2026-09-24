@@ -22,6 +22,7 @@ form, with --dry-run / --rescan-existing / --batch-size:
     docker compose exec ip-intel python -m scripts.ingest_opencti_channels
 
 Requires OPENCTI_URL / OPENCTI_TOKEN (already set via .env in the container).
+Use --limit N to submit at most N new seed domains in one run.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ import sys
 from cases.case_runtime import CaseRuntime
 from db.intel_db import rebuild_clusters
 from integrations.opencti_ingest import fetch_all_website_channel_data
-from integrations.opencti_sweep import INPUT_MODE, prepare_sweep, run_batches, split_batches
+from integrations.opencti_sweep import INPUT_MODE, prepare_sweep, run_batches, select_inputs, split_batches
 
 
 def _configure_logging() -> None:
@@ -103,12 +104,25 @@ def _print_progress(job: dict) -> None:
     )
 
 
+def _positive_int(value: str) -> int:
+    count = int(value)
+    if count < 1:
+        raise argparse.ArgumentTypeError("limit must be a positive integer")
+    return count
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Fetch and print the domain/tier/label list from OpenCTI without ingesting anything.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=_positive_int,
+        metavar="N",
+        help="Import at most N new seed domains; repeat to take the next N.",
     )
     parser.add_argument(
         "--poll-interval",
@@ -158,7 +172,13 @@ def main() -> None:
     print(f"Found {len(domain_data)} domain(s) from website channels ({tiered_count} with a tier label).")
 
     if args.dry_run:
-        for domain in sorted(domain_data):
+        preview_names = sorted(domain_data)
+        if args.limit is not None:
+            _, _, selected = select_inputs(
+                domain_data, rescan_existing=args.rescan_existing, limit=args.limit,
+            )
+            preview_names = [item["input_value"] for item in selected]
+        for domain in preview_names:
             entry = domain_data[domain]
             tier_text = f"tier {entry['tier']}" if entry["tier"] is not None else "no tier"
             labels_text = f"  [{', '.join(entry['labels'])}]" if entry["labels"] else ""
@@ -166,8 +186,10 @@ def main() -> None:
         return
 
     print("Recording domain tiers and checking which channels are already in the pool...")
-    plan = prepare_sweep(domain_data, rescan_existing=args.rescan_existing)
+    plan = prepare_sweep(domain_data, rescan_existing=args.rescan_existing, limit=args.limit)
     print(f"  set tier on {plan.tiers_written} domain(s).")
+    if plan.deferred:
+        print(f"  {plan.deferred} new domain(s) deferred by the limit.")
     if plan.skipped:
         print(
             f"Skipping {plan.skipped} channel(s) already in the DB "
@@ -176,9 +198,10 @@ def main() -> None:
 
     if not plan.to_scan:
         print("No new channels to scan.")
-        print("Rebuilding graph materializations...")
-        graph_counts = rebuild_clusters()
-        print(f"  graph rebuild: {graph_counts}")
+        if args.limit is None:
+            print("Rebuilding graph materializations...")
+            graph_counts = rebuild_clusters()
+            print(f"  graph rebuild: {graph_counts}")
         return
 
     # Split into sequential batches so each case completes and persists before

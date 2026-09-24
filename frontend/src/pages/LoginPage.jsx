@@ -84,7 +84,7 @@ export default function LoginPage() {
           <CardTitle>Sign in to IP Intel</CardTitle>
           <CardDescription>
             {step === "email"
-              ? mattermostEnabled ? "Use your stratc.org email address or Mattermost account." : "Use your stratc.org email address."
+              ? mattermostEnabled ? "Continue with Mattermost or sign in by email." : "Sign in with a code sent to your email."
               : `Enter the code we sent to ${email}.`}
           </CardDescription>
         </CardHeader>

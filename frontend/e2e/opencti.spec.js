@@ -31,13 +31,15 @@ async function mockApi(page, { role, onImport }) {
 
 test("admins can import OpenCTI website channels from the Add channels sheet", async ({ page }) => {
   let imports = 0;
+  let requestedLimit;
   await mockApi(page, {
     role: "admin",
     onImport: (route) => {
       imports += 1;
+      requestedLimit = route.request().postDataJSON().limit;
       return route.fulfill({ status: 202, json: {
-        job_id: "job-1", job: { id: "job-1", total_targets: 250 },
-        channels: 900, skipped: 400, accepted: 500, batches: 2, tiers: 120, labels_refreshed: 380,
+        job_id: "job-1", job: { id: "job-1", total_targets: 3 },
+        channels: 900, skipped: 400, accepted: 3, deferred: 497, batches: 1, tiers: 1, labels_refreshed: 0,
       } });
     },
   });
@@ -47,12 +49,17 @@ test("admins can import OpenCTI website channels from the Add channels sheet", a
   await expect(page.getByText("Import from OpenCTI", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Import", exact: true }).click();
   await expect(page.getByText("Import website channels from OpenCTI?")).toBeVisible();
+  const limit = page.getByRole("spinbutton", { name: "New channels" });
+  await limit.fill("0");
+  await expect(page.getByRole("alertdialog").getByRole("button", { name: "Import", exact: true })).toBeDisabled();
+  await limit.fill("3");
   await page.getByRole("alertdialog").getByRole("button", { name: "Import", exact: true }).click();
 
   await expect(page.getByText("OpenCTI import started", { exact: true })).toBeVisible();
-  await expect(page.getByText(/Scanning 500 new channels in 2 batches\. 400 already in the pool were skipped/)).toBeVisible();
-  await expect(page.getByText("OpenCTI import · batch 1 of 2", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Scanning 3 new channels\. 400 already in the pool were skipped\. 497 remain for a later import/)).toBeVisible();
+  await expect(page.getByText("OpenCTI import", { exact: true })).toBeVisible();
   expect(imports).toBe(1);
+  expect(requestedLimit).toBe(3);
 });
 
 test("the OpenCTI import is hidden from non-admins", async ({ page }) => {

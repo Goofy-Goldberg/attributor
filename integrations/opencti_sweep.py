@@ -39,6 +39,7 @@ class SweepPlan:
     tiers_written: int
     to_scan: list[dict[str, Any]]
     skipped: int = 0
+    deferred: int = 0
     labels_refreshed: int = 0
     normalized_labels: dict[str, list[str]] = field(default_factory=dict)
 
@@ -53,21 +54,40 @@ class SweepResult:
     labels_missing: int = 0
 
 
-def prepare_sweep(domain_data: dict[str, dict], *, rescan_existing: bool = False) -> SweepPlan:
-    """Record tiers for every channel and decide which domains still need a scan.
+def select_inputs(
+    domain_data: dict[str, dict], *, rescan_existing: bool = False, limit: int | None = None,
+) -> tuple[list[dict[str, Any]], set[str], list[dict[str, Any]]]:
+    """Read-only selection shared by the sweep and CLI preview."""
+    if limit is not None and (isinstance(limit, bool) or limit < 1):
+        raise ValueError("limit must be a positive integer")
+
+    inputs = normalize_inputs(sorted(domain_data) if limit is not None else list(domain_data))
+    targets = {item["normalized_target"] for item in inputs}
+    already = set() if rescan_existing or not inputs else existing_search_targets(list(targets)) & targets
+    new_inputs = [item for item in inputs if item["normalized_target"] not in already]
+    to_scan = new_inputs[:limit] if limit is not None else new_inputs
+    return inputs, already, to_scan
+
+
+def prepare_sweep(
+    domain_data: dict[str, dict], *, rescan_existing: bool = False, limit: int | None = None,
+) -> SweepPlan:
+    """Select domains to scan and write metadata for the selected scope.
 
     `domain_data` is `fetch_all_website_channel_data()`'s
     {domain: {"labels": [...], "tier": int | None}} map.
     """
-    # Tier is durable, per-domain classification, independent of any one
-    # scan's success — set it up front so it's recorded even if a domain's
-    # analysis later fails or times out. domain_tiers is keyed on the
-    # *registrable* domain (same rollup key domain_profile/graph lookups
-    # use), so a channel resolving to a subdomain still needs collapsing to
-    # its apex here, or the tier would be stored under a key nothing ever
-    # looks up.
+    inputs, already, to_scan = select_inputs(
+        domain_data, rescan_existing=rescan_existing, limit=limit,
+    )
+    skipped_inputs = [item for item in inputs if item["normalized_target"] in already]
+    metadata_inputs = to_scan if limit is not None else inputs
+
+    # Record tiers before scanning; collapse subdomains to the durable apex key.
     tiers_written = 0
-    for domain, entry in domain_data.items():
+    for item in metadata_inputs:
+        domain = item["input_value"]
+        entry = domain_data[domain]
         if entry["tier"] is None:
             continue
         apex = registrable_domain(clean_target(domain))
@@ -76,33 +96,20 @@ def prepare_sweep(domain_data: dict[str, dict], *, rescan_existing: bool = False
         set_domain_tier(apex, entry["tier"], source="opencti")
         tiers_written += 1
 
-    inputs = normalize_inputs(list(domain_data.keys()))
-    # Labels are keyed by clean_target() so lookups line up exactly with the
-    # normalized_target each search was actually saved under.
     normalized_labels = {
-        clean_target(domain): entry["labels"]
-        for domain, entry in domain_data.items()
-        if entry["labels"]
+        item["normalized_target"]: domain_data[item["input_value"]]["labels"]
+        for item in metadata_inputs
+        if domain_data[item["input_value"]]["labels"]
     }
     plan = SweepPlan(
         channel_count=len(domain_data),
         tiers_written=tiers_written,
-        to_scan=inputs,
+        to_scan=to_scan,
+        skipped=len(skipped_inputs),
+        deferred=len(inputs) - len(already) - len(to_scan),
         normalized_labels=normalized_labels,
     )
-    if rescan_existing or not inputs:
-        return plan
-
-    # Skip channels already in the pool: the analysis pipeline is the expensive
-    # part, and a channel with an existing search has already been through it.
-    # Tiers were recorded above for *every* channel regardless, and labels for
-    # skipped channels are refreshed here (they already have a search to attach
-    # to), so only the re-scan is avoided — not the durable metadata.
-    already = existing_search_targets([item["normalized_target"] for item in inputs])
-    skipped_inputs = [item for item in inputs if item["normalized_target"] in already]
-    plan.to_scan = [item for item in inputs if item["normalized_target"] not in already]
-    plan.skipped = len(skipped_inputs)
-    if skipped_inputs:
+    if skipped_inputs and limit is None:
         plan.labels_refreshed, _ = attach_labels(skipped_inputs, normalized_labels)
     return plan
 

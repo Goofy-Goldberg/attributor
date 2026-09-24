@@ -125,6 +125,9 @@ before using this standalone run.
 
 ## Docker
 
+For the iris host deployment and OpenCTI connection, see
+[docs/iris-deployment.md](docs/iris-deployment.md).
+
 ```bash
 docker compose up -d --build
 ```
@@ -681,8 +684,8 @@ Docker, tests, or README conformance.
 
 `integrations/opencti_ingest.py` pulls targets from OpenCTI (set `OPENCTI_URL` and `OPENCTI_TOKEN`). The website-channel sweep below (`integrations/opencti_sweep.py`) has two triggers:
 
-- **"Import from OpenCTI"** in the web UI's *Add channels* sheet (admins only; `POST /api/ingest/opencti`) — runs the sweep with the defaults (skip existing channels, batches of 250). The server submits the first batch before answering and returns its job; the remaining batches run one after another on a background thread and appear in the scan list as each starts, followed by a `rebuild_clusters()`. Only one sweep runs at a time (a second click gets `409`), and a restart ends it like any other in-flight job.
-- **`scripts/ingest_opencti_channels.py`** — the same sweep as a blocking Docker command, with `--dry-run`, `--rescan-existing` and `--batch-size`.
+- **"Import from OpenCTI"** in the web UI's *Add channels* sheet (admins only; `POST /api/ingest/opencti`) — accepts 1–250 new seed channels (default 10), skips existing channels, and batches scans at 250. Follow-up discovery can add more analysis targets. The server submits the first batch before answering and returns its job; remaining batches run on a background thread and appear in the scan list, followed by a `rebuild_clusters()`. Only one sweep runs at a time (a second click gets `409`), and a restart ends it like any other in-flight job.
+- **`scripts/ingest_opencti_channels.py`** — the same sweep as a blocking Docker command, with `--dry-run`, `--rescan-existing`, `--batch-size`, and optional `--limit N`.
 - `_run()` / `restart_ingestion()` / `retry_source_errors()` in `integrations/opencti_ingest.py` — an older worker that separately pulled Domain-Name observables and Channel SDOs and ran them through `core/ip_intel.py`'s CLI engine rather than the current app ingest pipeline (`OPENCTI_INGEST_CHANNELS`, `OPENCTI_INGEST_WORKERS` control it). Nothing in the running app calls `start_background_ingestion()`/`restart_ingestion()` anymore — it's dead code, kept because `tests/test_opencti_ingest.py` still exercises it.
 
 Channel SDOs (STIX 2.1 extension) are resolved to domains the same way in both live paths (`_channel_candidate_domains`): the channel `name` and aliases are used when they parse as a domain/URL, plus any external reference URLs, normalized to bare registrable domains (scheme, path, port, and leading `www.` stripped). Social-media platform domains (facebook.com, x.com, youtube.com, t.me, vk.com, etc.) are skipped per the "non-social media channels" goal.
@@ -693,7 +696,18 @@ Channel SDOs (STIX 2.1 extension) are resolved to domains the same way in both l
 docker compose exec ip-intel python -m scripts.ingest_opencti_channels
 # preview the domain/tier/label list without ingesting anything:
 docker compose exec ip-intel python -m scripts.ingest_opencti_channels --dry-run
+# preview and then import at most 10 new seed domains:
+docker compose exec ip-intel python -m scripts.ingest_opencti_channels --dry-run --limit 10
+docker compose exec ip-intel python -m scripts.ingest_opencti_channels --limit 10
 ```
+
+`--limit N` selects up to N new seed domains in sorted order after excluding
+domains already in the pool. Repeat the command to advance to the next N.
+Tier and label writes are limited to the selected domains. The analysis pipeline
+may discover additional follow-up domains, so total analyzed targets can exceed
+the seed limit. `--rescan-existing` includes existing domains in the limit;
+repeating that combination selects the same first N again.
+OpenCTI HTTPS connections verify the server certificate.
 
 `scripts/ingest_opencti_channels.py`:
 

@@ -164,6 +164,18 @@ class OpenCtiChannelReadTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             opencti_ingest.fetch_all_website_channel_data()
 
+    def test_client_verifies_tls(self) -> None:
+        self._set_opencti_env()
+        options = {}
+
+        def client(*_args, **kwargs):
+            options.update(kwargs)
+            return _FakeApiWithChannels([])
+
+        opencti_ingest.OpenCTIApiClient = client
+        opencti_ingest.fetch_all_website_channel_data()
+        self.assertIs(options["ssl_verify"], True)
+
 
 if __name__ == "__main__":
     unittest.main()

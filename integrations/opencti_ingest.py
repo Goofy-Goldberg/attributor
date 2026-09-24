@@ -270,7 +270,7 @@ def fetch_all_website_channel_data() -> dict[str, dict]:
     if not url or not token:
         raise RuntimeError("OPENCTI_URL or OPENCTI_TOKEN not set")
 
-    api = OpenCTIApiClient(url, token, log_level="error")
+    api = OpenCTIApiClient(url, token, ssl_verify=True, log_level="error")
     list_channels = getattr(getattr(api, "channel", None), "list", None)
     if not callable(list_channels):
         raise RuntimeError("pycti channel API is not available in this client version")
@@ -315,7 +315,6 @@ def fetch_all_website_channel_data() -> dict[str, dict]:
         len(channels), len(result), skipped_social, tiered,
     )
     return result
-
 
 
 
